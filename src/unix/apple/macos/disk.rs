@@ -1,16 +1,16 @@
 // Take a look at the license at the top of the repository in the LICENSE file.
 
+use crate::DiskKind;
 use crate::sys::{
     disk::{get_int_value, get_str_value},
     macos::{ffi, utils::IOReleaser},
 };
-use crate::DiskKind;
 
-use objc2_core_foundation::{kCFAllocatorDefault, CFDictionary, CFRetained, CFString};
+use objc2_core_foundation::{CFDictionary, CFRetained, CFString, kCFAllocatorDefault};
 use objc2_io_kit::{
-    io_iterator_t, io_registry_entry_t, kIOMasterPortDefault, kIOServicePlane, IOBSDNameMatching,
-    IOIteratorNext, IOObjectConformsTo, IORegistryEntryCreateCFProperty,
-    IORegistryEntryGetParentEntry, IOServiceGetMatchingServices,
+    IOBSDNameMatching, IOIteratorNext, IOObjectConformsTo, IORegistryEntryCreateCFProperty,
+    IORegistryEntryGetParentEntry, IOServiceGetMatchingServices, io_iterator_t,
+    io_registry_entry_t, kIOMasterPortDefault, kIOServicePlane,
 };
 
 fn iterate_service_tree<T, F>(bsd_name: &[u8], key: &CFString, eval: F) -> Option<T>
@@ -68,12 +68,11 @@ where
                 )
             };
 
-            if let Some(properties) = properties_result {
-                if let Ok(properties) = properties.downcast::<CFDictionary>() {
-                    if let Some(result) = eval(parent_entry, &properties) {
-                        return Some(result);
-                    }
-                }
+            if let Some(properties) = properties_result
+                && let Ok(properties) = properties.downcast::<CFDictionary>()
+                && let Some(result) = eval(parent_entry, &properties)
+            {
+                return Some(result);
             }
         }
     }
@@ -106,9 +105,8 @@ pub(crate) fn get_disk_io(bsd_name: &[u8]) -> Option<(u64, u64)> {
     let stat_string = CFString::from_static_str(ffi::kIOBlockStorageDriverStatisticsKey);
 
     iterate_service_tree(bsd_name, &stat_string, |parent_entry, properties| {
-        if !unsafe {
-            IOObjectConformsTo(parent_entry, b"IOBlockStorageDriver\0".as_ptr() as *mut _)
-        } {
+        if !unsafe { IOObjectConformsTo(parent_entry, c"IOBlockStorageDriver".as_ptr() as *mut _) }
+        {
             return None;
         }
 

@@ -5,6 +5,7 @@ use crate::Component;
 
 pub(crate) struct ComponentInner {
     id: Vec<u8>,
+    component_id: String,
     label: String,
     temperature: Option<f32>,
     max: f32,
@@ -12,6 +13,17 @@ pub(crate) struct ComponentInner {
 }
 
 impl ComponentInner {
+    pub(crate) fn new(id: Vec<u8>, temperature: f32, core: usize) -> ComponentInner {
+        ComponentInner {
+            id,
+            component_id: format!("cpu_{}", core + 1),
+            label: format!("CPU {}", core + 1),
+            temperature: Some(temperature),
+            max: temperature,
+            updated: true,
+        }
+    }
+
     pub(crate) fn temperature(&self) -> Option<f32> {
         self.temperature
     }
@@ -24,6 +36,10 @@ impl ComponentInner {
         None
     }
 
+    pub(crate) fn id(&self) -> Option<&str> {
+        Some(&self.component_id)
+    }
+
     pub(crate) fn label(&self) -> &str {
         &self.label
     }
@@ -31,10 +47,10 @@ impl ComponentInner {
     pub(crate) fn refresh(&mut self) {
         unsafe {
             self.temperature = refresh_component(&self.id);
-            if let Some(temperature) = self.temperature {
-                if temperature > self.max {
-                    self.max = temperature;
-                }
+            if let Some(temperature) = self.temperature
+                && temperature > self.max
+            {
+                self.max = temperature;
             }
         }
     }
@@ -42,7 +58,7 @@ impl ComponentInner {
 
 unsafe fn refresh_component(id: &[u8]) -> Option<f32> {
     let mut temperature: libc::c_int = 0;
-    if !get_sys_value_by_name(id, &mut temperature) {
+    if unsafe { !get_sys_value_by_name(id, &mut temperature) } {
         None
     } else {
         // convert from Kelvin (x 10 -> 273.2 x 10) to Celsius
@@ -90,13 +106,7 @@ impl ComponentsInner {
                     let id = format!("dev.cpu.{core}.temperature\0").as_bytes().to_vec();
                     if let Some(temperature) = refresh_component(&id) {
                         self.components.push(Component {
-                            inner: ComponentInner {
-                                id,
-                                label: format!("CPU {}", core + 1),
-                                temperature: Some(temperature),
-                                max: temperature,
-                                updated: true,
-                            },
+                            inner: ComponentInner::new(id, temperature, core),
                         });
                     }
                 }
@@ -107,5 +117,29 @@ impl ComponentsInner {
                 c.inner.updated = true;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Component;
+    use crate::unix::freebsd::{ComponentInner, ComponentsInner};
+
+    #[test]
+    fn test_components() {
+        let component1 = Component {
+            inner: ComponentInner::new(b"dev.cpu.0.temperature\0".to_vec(), 1.234, 0),
+        };
+
+        let component2 = Component {
+            inner: ComponentInner::new(b"dev.cpu.1.temperature\0".to_vec(), 5.678, 1),
+        };
+        assert_eq!(component1.id(), Some("cpu_1"));
+        assert_eq!(component1.label(), "CPU 1");
+        assert_eq!(component1.temperature(), Some(1.234));
+
+        assert_eq!(component2.id(), Some("cpu_2"));
+        assert_eq!(component2.label(), "CPU 2");
+        assert_eq!(component2.temperature(), Some(5.678));
     }
 }

@@ -1,3 +1,26 @@
+# 0.37.2
+
+ * Improve documentation of `System::refresh_cpu_all` and of `System::refresh_cpu_specifics`.
+ * Android: Fix `System::uptime`.
+ * Linux: Correctly handled modified/removed `Process::exe` paths.
+
+# 0.37.1
+
+ * Fix `serde` serialization on `Process::name`.
+ * Linux: Fix `get_cpu_frequency` on `loongarch64`.
+ * Windows: Correctly handle invalid UTF-8 string in `Motherboard`.
+
+# 0.37.0
+
+ * Update minimum supported Rust version to `1.88` (for 2024 edition and `if let chain` feature).
+ * Added `Component::id` API.
+ * Linux: Greatly improve partial processes retrieval.
+ * Linux: Simplify internal components retrieval code.
+
+# 0.36.1
+
+* Linux: Improve processor CPU usage computation.
+
 # 0.36.0
 
  * Add new `Motherboard` type.

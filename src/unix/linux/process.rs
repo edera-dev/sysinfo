@@ -4,7 +4,7 @@ use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{self, DirEntry, File};
+use std::fs::{self, DirEntry, File, read_dir};
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use libc::{c_ulong, gid_t, uid_t};
 
 use crate::sys::system::SystemInfo;
 use crate::sys::utils::{
-    get_all_data_from_file, get_all_utf8_data, realpath, PathHandler, PathPush,
+    PathHandler, PathPush, get_all_data_from_file, get_all_utf8_data, realpath,
 };
 use crate::{
     DiskUsage, Gid, Pid, Process, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, Signal,
@@ -321,10 +321,10 @@ impl ProcessInner {
         match fs::read_to_string(&limits_files) {
             Ok(content) => {
                 for line in content.lines() {
-                    if let Some(line) = line.strip_prefix("Max open files ") {
-                        if let Some(nb) = line.split_whitespace().find(|p| !p.is_empty()) {
-                            return usize::from_str(nb).ok();
-                        }
+                    if let Some(line) = line.strip_prefix("Max open files ")
+                        && let Some(nb) = line.split_whitespace().find(|p| !p.is_empty())
+                    {
+                        return usize::from_str(nb).ok();
                     }
                 }
                 None
@@ -365,7 +365,7 @@ pub(crate) fn set_time(p: &mut ProcessInner, utime: u64, stime: u64) {
 }
 
 pub(crate) fn update_process_disk_activity(p: &mut ProcessInner, path: &mut PathHandler) {
-    let data = match get_all_utf8_data(path.join("io"), 16_384) {
+    let data = match get_all_utf8_data(path.replace_and_join("io"), 16_384) {
         Ok(d) => d,
         Err(_) => return,
     };
@@ -453,7 +453,7 @@ fn refresh_user_group_ids(
     }
 
     if let Some(((user_id, effective_user_id), (group_id, effective_group_id))) =
-        get_uid_and_gid(path.join("status"))
+        get_uid_and_gid(path.replace_and_join("status"))
     {
         p.user_id = Some(Uid(user_id));
         p.effective_user_id = Some(Uid(effective_user_id));
@@ -480,20 +480,34 @@ fn update_proc_info(
     if refresh_kind.exe().needs_update(|| p.exe.is_none()) {
         // Do not use cmd[0] because it is not the same thing.
         // See https://github.com/GuillaumeGomez/sysinfo/issues/697.
-        p.exe = realpath(proc_path.join("exe"));
+        p.exe = realpath(proc_path.replace_and_join("exe"));
+        // If the target executable file was modified or removed, linux appends ` (deleted)` at
+        // the end. We need to remove it.
+        // See https://github.com/GuillaumeGomez/sysinfo/issues/1585.
+        let deleted = b" (deleted)";
+        if let Some(exe) = &mut p.exe
+            && let Some(file_name) = exe.file_name()
+            && file_name.as_encoded_bytes().ends_with(deleted)
+        {
+            let mut file_name = file_name.as_encoded_bytes().to_vec();
+            file_name.truncate(file_name.len() - deleted.len());
+            unsafe {
+                exe.set_file_name(OsString::from_encoded_bytes_unchecked(file_name));
+            }
+        }
     }
 
     if refresh_kind.cmd().needs_update(|| p.cmd.is_empty()) {
-        p.cmd = copy_from_file(proc_path.join("cmdline"));
+        p.cmd = copy_from_file(proc_path.replace_and_join("cmdline"));
     }
     if refresh_kind.environ().needs_update(|| p.environ.is_empty()) {
-        p.environ = copy_from_file(proc_path.join("environ"));
+        p.environ = copy_from_file(proc_path.replace_and_join("environ"));
     }
     if refresh_kind.cwd().needs_update(|| p.cwd.is_none()) {
-        p.cwd = realpath(proc_path.join("cwd"));
+        p.cwd = realpath(proc_path.replace_and_join("cwd"));
     }
     if refresh_kind.root().needs_update(|| p.root.is_none()) {
-        p.root = realpath(proc_path.join("root"));
+        p.root = realpath(proc_path.replace_and_join("root"));
     }
 
     update_time_and_memory(proc_path, p, str_parts, uptime, info, refresh_kind);
@@ -718,7 +732,7 @@ fn update_time_and_memory(
         #[allow(clippy::collapsible_if)]
         if refresh_kind.memory() {
             // Keeping this nested level for readability reasons.
-            if !get_memory(path.join("statm"), entry, info) {
+            if !get_memory(path.replace_and_join("statm"), entry, info) {
                 old_get_memory(entry, str_parts, info);
             }
         }
@@ -736,56 +750,6 @@ struct ProcAndTasks {
     parent_pid: Option<Pid>,
     path: PathBuf,
     tasks: Option<HashSet<Pid>>,
-}
-
-fn get_all_pid_entries(
-    parent: Option<&OsStr>,
-    parent_pid: Option<Pid>,
-    entry: DirEntry,
-    data: &mut Vec<ProcAndTasks>,
-    enable_task_stats: bool,
-) -> Option<Pid> {
-    let Ok(file_type) = entry.file_type() else {
-        return None;
-    };
-    if !file_type.is_dir() {
-        return None;
-    }
-
-    let entry = entry.path();
-    let name = entry.file_name();
-
-    if name == parent {
-        // Needed because tasks have their own PID listed in the "task" folder.
-        return None;
-    }
-    let name = name?;
-    let pid = Pid::from(usize::from_str(name.to_str()?).ok()?);
-
-    let tasks = if enable_task_stats {
-        let tasks_dir = Path::join(&entry, "task");
-        if let Ok(entries) = fs::read_dir(tasks_dir) {
-            let mut tasks = HashSet::new();
-            for task in entries.into_iter().filter_map(|entry| {
-                get_all_pid_entries(Some(name), Some(pid), entry.ok()?, data, enable_task_stats)
-            }) {
-                tasks.insert(task);
-            }
-            Some(tasks)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    data.push(ProcAndTasks {
-        pid,
-        parent_pid,
-        path: entry,
-        tasks,
-    });
-    Some(pid)
 }
 
 #[cfg(feature = "multithread")]
@@ -810,7 +774,7 @@ where
 /// place, we need to get the task parent (if it's a task).
 pub(crate) fn refresh_procs(
     proc_list: &mut HashMap<Pid, Process>,
-    path: &Path,
+    proc_path: &Path,
     uptime: u64,
     info: &SystemInfo,
     processes_to_update: ProcessesToUpdate<'_>,
@@ -818,30 +782,6 @@ pub(crate) fn refresh_procs(
 ) -> usize {
     #[cfg(feature = "multithread")]
     use rayon::iter::ParallelIterator;
-
-    #[inline(always)]
-    fn real_filter(e: &ProcAndTasks, filter: &[Pid]) -> bool {
-        filter.contains(&e.pid)
-    }
-
-    #[inline(always)]
-    fn empty_filter(_e: &ProcAndTasks, _filter: &[Pid]) -> bool {
-        true
-    }
-
-    #[allow(clippy::type_complexity)]
-    let (filter, filter_callback): (
-        &[Pid],
-        &(dyn Fn(&ProcAndTasks, &[Pid]) -> bool + Sync + Send),
-    ) = match processes_to_update {
-        ProcessesToUpdate::All => (&[], &empty_filter),
-        ProcessesToUpdate::Some(pids) => {
-            if pids.is_empty() {
-                return 0;
-            }
-            (pids, &real_filter)
-        }
-    };
 
     let nb_updated = AtomicUsize::new(0);
 
@@ -855,23 +795,26 @@ pub(crate) fn refresh_procs(
     // parallel iterator, we can safely use it inside the parallel iterator and update its entries
     // concurrently.
     let procs = {
-        let d = match fs::read_dir(path) {
-            Ok(d) => d,
-            Err(_err) => {
-                sysinfo_debug!("Failed to read folder {path:?}: {_err:?}");
-                return 0;
-            }
+        let pid_iter: Box<dyn Iterator<Item = (PathBuf, Pid)> + Send> = match processes_to_update {
+            ProcessesToUpdate::All => match read_dir(proc_path) {
+                Ok(proc_entries) => Box::new(proc_entries.filter_map(filter_pid_entries)),
+                Err(_err) => {
+                    sysinfo_debug!("Failed to read folder {proc_path:?}: {_err:?}");
+                    return 0;
+                }
+            },
+            ProcessesToUpdate::Some(pids) => Box::new(
+                pids.iter()
+                    .map(|pid| (proc_path.join(pid.to_string()), *pid)),
+            ),
         };
+
         let proc_list = Wrap(UnsafeCell::new(proc_list));
 
-        iter(d)
-            .flat_map(|entry| {
-                let Ok(entry) = entry else { return Vec::new() };
-                let mut entries = Vec::new();
-                get_all_pid_entries(None, None, entry, &mut entries, refresh_kind.tasks());
-                entries
+        iter(pid_iter)
+            .flat_map(|(path, pid)| {
+                get_proc_and_tasks(path, pid, refresh_kind, processes_to_update)
             })
-            .filter(|e| filter_callback(e, filter))
             .filter_map(|e| {
                 let proc_list = proc_list.get();
                 let new_process = _get_process_data(
@@ -896,37 +839,90 @@ pub(crate) fn refresh_procs(
     nb_updated.into_inner()
 }
 
-// FIXME: To be removed once MSRV for this crate is 1.80 and use the `trim_ascii()` method instead.
-fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
-    // Code from Rust code library.
-    while let [rest @ .., last] = bytes {
-        if last.is_ascii_whitespace() {
-            bytes = rest;
-        } else {
-            break;
-        }
+fn filter_pid_entries(entry: Result<DirEntry, std::io::Error>) -> Option<(PathBuf, Pid)> {
+    if let Ok(entry) = entry
+        && let Ok(file_type) = entry.file_type()
+        && file_type.is_dir()
+        && let Some(name) = entry.file_name().to_str()
+        && let Ok(pid) = usize::from_str(name)
+    {
+        Some((entry.path(), Pid::from(pid)))
+    } else {
+        None
     }
-    while let [first, rest @ ..] = bytes {
-        if first.is_ascii_whitespace() {
-            bytes = rest;
-        } else {
-            break;
+}
+
+fn get_proc_and_tasks(
+    path: PathBuf,
+    pid: Pid,
+    refresh_kind: ProcessRefreshKind,
+    processes_to_update: ProcessesToUpdate<'_>,
+) -> Vec<ProcAndTasks> {
+    let mut parent_pid = None;
+    let (mut procs, mut tasks) = if refresh_kind.tasks() {
+        let procs = get_proc_tasks(&path, pid);
+        let tasks = procs.iter().map(|ProcAndTasks { pid, .. }| *pid).collect();
+
+        (procs, Some(tasks))
+    } else {
+        (Vec::new(), None)
+    };
+
+    if processes_to_update != ProcessesToUpdate::All {
+        // If the process' tgid doesn't match its pid, it is a task
+        if let Some(tgid) = get_tgid(&path.join("status"))
+            && tgid != pid
+        {
+            parent_pid = Some(tgid);
+            tasks = None;
         }
+
+        // Don't add the tasks to the list of processes to update
+        procs.clear();
     }
-    bytes
+
+    procs.push(ProcAndTasks {
+        pid,
+        parent_pid,
+        path,
+        tasks,
+    });
+
+    procs
+}
+
+fn get_proc_tasks(path: &Path, parent_pid: Pid) -> Vec<ProcAndTasks> {
+    let task_path = path.join("task");
+
+    read_dir(task_path)
+        .ok()
+        .map(|task_entries| {
+            task_entries
+                .filter_map(filter_pid_entries)
+                // Needed because tasks have their own PID listed in the "task" folder.
+                .filter(|(_, pid)| *pid != parent_pid)
+                .map(|(path, pid)| ProcAndTasks {
+                    pid,
+                    path,
+                    parent_pid: Some(parent_pid),
+                    tasks: None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn split_content(mut data: &[u8]) -> Vec<OsString> {
     let mut out = Vec::with_capacity(10);
     while let Some(pos) = data.iter().position(|c| *c == 0) {
-        let s = trim_ascii(&data[..pos]);
+        let s = &data[..pos].trim_ascii();
         if !s.is_empty() {
             out.push(OsStr::from_bytes(s).to_os_string());
         }
         data = &data[pos + 1..];
     }
     if !data.is_empty() {
-        let s = trim_ascii(data);
+        let s = data.trim_ascii();
         if !s.is_empty() {
             out.push(OsStr::from_bytes(s).to_os_string());
         }
@@ -998,6 +994,15 @@ fn get_uid_and_gid(file_path: &Path) -> Option<((uid_t, uid_t), (gid_t, gid_t))>
         }
         _ => None,
     }
+}
+
+fn get_tgid(file_path: &Path) -> Option<Pid> {
+    const TGID_KEY: &str = "Tgid:";
+    let status_data = get_all_utf8_data(file_path, 16_385).ok()?;
+    let tgid_line = status_data
+        .lines()
+        .find(|line| line.starts_with(TGID_KEY))?;
+    tgid_line[TGID_KEY.len()..].trim_start().parse().ok()
 }
 
 struct Parts<'a> {

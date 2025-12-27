@@ -1,26 +1,40 @@
 // Take a look at the license at the top of the repository in the LICENSE file.
 
-use crate::sys::macos::{ffi, utils::IOReleaser};
 use crate::Component;
+use crate::sys::macos::{ffi, utils::IOReleaser};
 
 use libc::{c_char, c_int, c_void};
 use objc2_core_foundation::{CFDictionary, CFRetained};
 use objc2_io_kit::{
-    io_connect_t, io_iterator_t, kIOMasterPortDefault, kIOReturnSuccess, IOConnectCallStructMethod,
-    IOIteratorNext, IOServiceClose, IOServiceGetMatchingServices, IOServiceMatching, IOServiceOpen,
+    IOConnectCallStructMethod, IOIteratorNext, IOServiceClose, IOServiceGetMatchingServices,
+    IOServiceMatching, IOServiceOpen, io_connect_t, io_iterator_t, kIOMasterPortDefault,
+    kIOReturnSuccess,
 };
 
 use std::mem;
 
-const COMPONENTS_TEMPERATURE_IDS: &[(&str, &[i8])] = &[
-    ("PECI CPU", &['T' as i8, 'C' as i8, 'X' as i8, 'C' as i8]), // PECI CPU "TCXC"
-    ("PECI CPU", &['T' as i8, 'C' as i8, 'X' as i8, 'c' as i8]), // PECI CPU "TCXc"
+const COMPONENTS_TEMPERATURE_IDS: &[(&str, &str, &[i8])] = &[
+    (
+        "PECI CPU",
+        "TCXC",
+        &['T' as i8, 'C' as i8, 'X' as i8, 'C' as i8],
+    ), // PECI CPU "TCXC"
+    (
+        "PECI CPU",
+        "TCXc",
+        &['T' as i8, 'C' as i8, 'X' as i8, 'c' as i8],
+    ), // PECI CPU "TCXc"
     (
         "CPU Proximity",
+        "TC0P",
         &['T' as i8, 'C' as i8, '0' as i8, 'P' as i8],
     ), // CPU Proximity (heat spreader) "TC0P"
-    ("GPU", &['T' as i8, 'G' as i8, '0' as i8, 'P' as i8]),      // GPU "TG0P"
-    ("Battery", &['T' as i8, 'B' as i8, '0' as i8, 'T' as i8]),  // Battery "TB0T"
+    ("GPU", "TG0P", &['T' as i8, 'G' as i8, '0' as i8, 'P' as i8]), // GPU "TG0P"
+    (
+        "Battery",
+        "TB0T",
+        &['T' as i8, 'B' as i8, '0' as i8, 'T' as i8],
+    ), // Battery "TB0T"
 ];
 
 pub(crate) struct ComponentFFI {
@@ -92,13 +106,18 @@ impl ComponentsInner {
         let critical_temp =
             get_temperature(connection, &['T' as i8, 'C' as i8, '0' as i8, 'D' as i8, 0]);
 
-        for (id, v) in COMPONENTS_TEMPERATURE_IDS.iter() {
-            if let Some(c) = self.components.iter_mut().find(|c| c.inner.label == *id) {
+        for (label, id, v) in COMPONENTS_TEMPERATURE_IDS.iter() {
+            if let Some(c) = self.components.iter_mut().find(|c| c.inner.id == *id) {
                 c.refresh();
                 c.inner.updated = true;
-            } else if let Some(c) =
-                ComponentInner::new((*id).to_owned(), None, critical_temp, v, connection)
-            {
+            } else if let Some(c) = ComponentInner::new(
+                (*id).to_owned(),
+                (*label).to_owned(),
+                None,
+                critical_temp,
+                v,
+                connection,
+            ) {
                 self.components.push(Component { inner: c });
             }
         }
@@ -106,6 +125,7 @@ impl ComponentsInner {
 }
 
 pub(crate) struct ComponentInner {
+    id: String,
     temperature: Option<f32>,
     max: f32,
     critical: Option<f32>,
@@ -117,6 +137,7 @@ pub(crate) struct ComponentInner {
 impl ComponentInner {
     /// Creates a new `ComponentInner` with the given information.
     pub(crate) fn new(
+        id: String,
         label: String,
         max: Option<f32>,
         critical: Option<f32>,
@@ -125,6 +146,7 @@ impl ComponentInner {
     ) -> Option<Self> {
         let ffi_part = ComponentFFI::new(key, connection)?;
         ffi_part.temperature().map(|temperature| Self {
+            id,
             temperature: Some(temperature),
             label,
             max: max.unwrap_or(temperature),
@@ -150,6 +172,10 @@ impl ComponentInner {
         &self.label
     }
 
+    pub(crate) fn id(&self) -> Option<&str> {
+        Some(&self.id)
+    }
+
     pub(crate) fn refresh(&mut self) {
         self.temperature = self.ffi_part.temperature();
         if let Some(temperature) = self.temperature {
@@ -168,14 +194,16 @@ unsafe fn perform_call(
 ) -> i32 {
     let mut structure_output_size = mem::size_of::<ffi::KeyData_t>();
 
-    IOConnectCallStructMethod(
-        conn,
-        index as u32,
-        input_structure.cast(),
-        mem::size_of::<ffi::KeyData_t>(),
-        output_structure.cast(),
-        &mut structure_output_size,
-    )
+    unsafe {
+        IOConnectCallStructMethod(
+            conn,
+            index as u32,
+            input_structure.cast(),
+            mem::size_of::<ffi::KeyData_t>(),
+            output_structure.cast(),
+            &mut structure_output_size,
+        )
+    }
 }
 
 // Adapted from https://github.com/lavoiesl/osx-cpu-temp/blob/master/smc.c#L28
@@ -191,39 +219,43 @@ fn strtoul(s: &[i8]) -> u32 {
 
 #[inline]
 unsafe fn ultostr(s: *mut c_char, val: u32) {
-    *s.offset(0) = ((val >> 24) % 128) as i8;
-    *s.offset(1) = ((val >> 16) % 128) as i8;
-    *s.offset(2) = ((val >> 8) % 128) as i8;
-    *s.offset(3) = (val % 128) as i8;
-    *s.offset(4) = 0;
+    unsafe {
+        *s.offset(0) = ((val >> 24) % 128) as i8;
+        *s.offset(1) = ((val >> 16) % 128) as i8;
+        *s.offset(2) = ((val >> 8) % 128) as i8;
+        *s.offset(3) = (val % 128) as i8;
+        *s.offset(4) = 0;
+    }
 }
 
 unsafe fn get_key_size(con: io_connect_t, key: &[i8]) -> Result<(ffi::KeyData_t, ffi::Val_t), i32> {
-    let mut input_structure: ffi::KeyData_t = mem::zeroed::<ffi::KeyData_t>();
-    let mut output_structure: ffi::KeyData_t = mem::zeroed::<ffi::KeyData_t>();
-    let mut val: ffi::Val_t = mem::zeroed::<ffi::Val_t>();
+    unsafe {
+        let mut input_structure: ffi::KeyData_t = mem::zeroed::<ffi::KeyData_t>();
+        let mut output_structure: ffi::KeyData_t = mem::zeroed::<ffi::KeyData_t>();
+        let mut val: ffi::Val_t = mem::zeroed::<ffi::Val_t>();
 
-    input_structure.key = strtoul(key);
-    input_structure.data8 = ffi::SMC_CMD_READ_KEYINFO;
+        input_structure.key = strtoul(key);
+        input_structure.data8 = ffi::SMC_CMD_READ_KEYINFO;
 
-    let result = perform_call(
-        con,
-        ffi::KERNEL_INDEX_SMC,
-        &input_structure,
-        &mut output_structure,
-    );
-    if result != kIOReturnSuccess {
-        return Err(result);
+        let result = perform_call(
+            con,
+            ffi::KERNEL_INDEX_SMC,
+            &input_structure,
+            &mut output_structure,
+        );
+        if result != kIOReturnSuccess {
+            return Err(result);
+        }
+
+        val.data_size = output_structure.key_info.data_size;
+        ultostr(
+            val.data_type.as_mut_ptr(),
+            output_structure.key_info.data_type,
+        );
+        input_structure.key_info.data_size = val.data_size;
+        input_structure.data8 = ffi::SMC_CMD_READ_BYTES;
+        Ok((input_structure, val))
     }
-
-    val.data_size = output_structure.key_info.data_size;
-    ultostr(
-        val.data_type.as_mut_ptr(),
-        output_structure.key_info.data_type,
-    );
-    input_structure.key_info.data_size = val.data_size;
-    input_structure.data8 = ffi::SMC_CMD_READ_BYTES;
-    Ok((input_structure, val))
 }
 
 unsafe fn read_key(
@@ -231,24 +263,26 @@ unsafe fn read_key(
     input_structure: &ffi::KeyData_t,
     mut val: ffi::Val_t,
 ) -> Result<ffi::Val_t, i32> {
-    let mut output_structure: ffi::KeyData_t = mem::zeroed::<ffi::KeyData_t>();
+    unsafe {
+        let mut output_structure: ffi::KeyData_t = mem::zeroed::<ffi::KeyData_t>();
 
-    #[allow(non_upper_case_globals)]
-    match perform_call(
-        con,
-        ffi::KERNEL_INDEX_SMC,
-        input_structure,
-        &mut output_structure,
-    ) {
-        kIOReturnSuccess => {
-            libc::memcpy(
-                val.bytes.as_mut_ptr() as *mut c_void,
-                output_structure.bytes.as_mut_ptr() as *mut c_void,
-                mem::size_of::<[u8; 32]>(),
-            );
-            Ok(val)
+        #[allow(non_upper_case_globals)]
+        match perform_call(
+            con,
+            ffi::KERNEL_INDEX_SMC,
+            input_structure,
+            &mut output_structure,
+        ) {
+            kIOReturnSuccess => {
+                libc::memcpy(
+                    val.bytes.as_mut_ptr() as *mut c_void,
+                    output_structure.bytes.as_mut_ptr() as *mut c_void,
+                    mem::size_of::<[u8; 32]>(),
+                );
+                Ok(val)
+            }
+            result => Err(result),
         }
-        result => Err(result),
     }
 }
 
@@ -260,7 +294,7 @@ fn get_temperature_inner(
     unsafe {
         if let Ok(val) = read_key(con, input_structure, (*original_val).clone()) {
             if val.data_size > 0
-                && libc::strcmp(val.data_type.as_ptr(), b"sp78\0".as_ptr() as *const i8) == 0
+                && libc::strcmp(val.data_type.as_ptr(), c"sp78".as_ptr() as *const i8) == 0
             {
                 // convert sp78 value to temperature
                 let x = (i32::from(val.bytes[0]) << 6) + (i32::from(val.bytes[1]) >> 2);
@@ -282,11 +316,7 @@ pub(crate) struct IoService(io_connect_t);
 
 impl IoService {
     fn new(obj: io_connect_t) -> Option<Self> {
-        if obj == 0 {
-            None
-        } else {
-            Some(Self(obj))
-        }
+        if obj == 0 { None } else { Some(Self(obj)) }
     }
 
     pub(crate) fn inner(&self) -> io_connect_t {
@@ -299,7 +329,7 @@ impl IoService {
         let mut iterator: io_iterator_t = 0;
 
         unsafe {
-            let Some(matching) = IOServiceMatching(b"AppleSMC\0".as_ptr() as *const i8) else {
+            let Some(matching) = IOServiceMatching(c"AppleSMC".as_ptr() as *const i8) else {
                 sysinfo_debug!("IOServiceMatching call failed, `AppleSMC` not found");
                 return None;
             };
@@ -314,7 +344,9 @@ impl IoService {
             let iterator = match IOReleaser::new(iterator) {
                 Some(i) => i,
                 None => {
-                    sysinfo_debug!("Error: IOServiceGetMatchingServices() succeeded but returned invalid descriptor");
+                    sysinfo_debug!(
+                        "Error: IOServiceGetMatchingServices() succeeded but returned invalid descriptor"
+                    );
                     return None;
                 }
             };

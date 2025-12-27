@@ -2,20 +2,20 @@
 
 use crate::Component;
 
-use windows::core::w;
 use windows::Win32::Foundation::{SysAllocString, SysFreeString};
 use windows::Win32::Security::PSECURITY_DESCRIPTOR;
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoInitializeSecurity, CoSetProxyBlanket,
-    CLSCTX_INPROC_SERVER, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_AUTHN_LEVEL_DEFAULT,
+    CLSCTX_INPROC_SERVER, CoCreateInstance, CoInitializeEx, CoInitializeSecurity,
+    CoSetProxyBlanket, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_AUTHN_LEVEL_DEFAULT,
     RPC_C_IMP_LEVEL_IMPERSONATE,
 };
 use windows::Win32::System::Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE};
-use windows::Win32::System::Variant::{VariantClear, VARIANT};
+use windows::Win32::System::Variant::{VARIANT, VariantClear};
 use windows::Win32::System::Wmi::{
-    IEnumWbemClassObject, IWbemLocator, IWbemServices, WbemLocator, WBEM_FLAG_FORWARD_ONLY,
-    WBEM_FLAG_NONSYSTEM_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE,
+    IEnumWbemClassObject, IWbemLocator, IWbemServices, WBEM_FLAG_FORWARD_ONLY,
+    WBEM_FLAG_NONSYSTEM_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE, WbemLocator,
 };
+use windows::core::w;
 
 use std::cell::OnceCell;
 use std::sync::OnceLock;
@@ -65,6 +65,10 @@ impl ComponentInner {
         &self.label
     }
 
+    pub(crate) fn id(&self) -> Option<&str> {
+        Some(&self.label)
+    }
+
     pub(crate) fn refresh(&mut self) {
         if self.connection.is_none() {
             self.connection = Connection::new()
@@ -77,12 +81,12 @@ impl ComponentInner {
         } else {
             None
         };
-        if let Some(ref mut connection) = self.connection {
-            if let Some((temperature, _)) = connection.temperature(false) {
-                self.temperature = temperature;
-                if self.temperature > self.max {
-                    self.max = self.temperature;
-                }
+        if let Some(ref mut connection) = self.connection
+            && let Some((temperature, _)) = connection.temperature(false)
+        {
+            self.temperature = temperature;
+            if self.temperature > self.max {
+                self.max = self.temperature;
             }
         }
     }
@@ -132,9 +136,7 @@ impl ComponentsInner {
 }
 
 macro_rules! bstr {
-    ($x:literal) => {{
-        SysAllocString(w!($x))
-    }};
+    ($x:literal) => {{ SysAllocString(w!($x)) }};
 }
 
 struct Connection {
@@ -153,7 +155,7 @@ thread_local! {
 }
 
 unsafe fn initialize_connection() -> Result<(), ()> {
-    if CoInitializeEx(None, Default::default()).is_err() {
+    if unsafe { CoInitializeEx(None, Default::default()) }.is_err() {
         sysinfo_debug!("Failed to initialize connection");
         Err(())
     } else {
@@ -162,17 +164,19 @@ unsafe fn initialize_connection() -> Result<(), ()> {
 }
 
 unsafe fn initialize_security() -> Result<(), ()> {
-    if CoInitializeSecurity(
-        Some(PSECURITY_DESCRIPTOR::default()),
-        -1,
-        None,
-        None,
-        RPC_C_AUTHN_LEVEL_DEFAULT,
-        RPC_C_IMP_LEVEL_IMPERSONATE,
-        None,
-        EOAC_NONE,
-        None,
-    )
+    if unsafe {
+        CoInitializeSecurity(
+            Some(PSECURITY_DESCRIPTOR::default()),
+            -1,
+            None,
+            None,
+            RPC_C_AUTHN_LEVEL_DEFAULT,
+            RPC_C_IMP_LEVEL_IMPERSONATE,
+            None,
+            EOAC_NONE,
+            None,
+        )
+    }
     .is_err()
     {
         sysinfo_debug!("Failed to initialize security");

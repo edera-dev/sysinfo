@@ -1,18 +1,18 @@
 // Take a look at the license at the top of the repository in the LICENSE file.
 
 use objc2_core_foundation::{
-    kCFAllocatorDefault, CFArray, CFDictionary, CFNumber, CFRetained, CFString,
+    CFArray, CFDictionary, CFNumber, CFRetained, CFString, kCFAllocatorDefault,
 };
 use objc2_io_kit::{IOHIDEventSystemClient, IOHIDServiceClient};
 
-use crate::sys::inner::ffi::{
-    kHIDPage_AppleVendor, kHIDUsage_AppleVendor_TemperatureSensor, kIOHIDEventTypeTemperature,
-    IOHIDEventFieldBase, IOHIDEventGetFloatValue, IOHIDEventSystemClientCreate,
-    IOHIDEventSystemClientSetMatching, IOHIDServiceClientCopyEvent,
-    HID_DEVICE_PROPERTY_PRIMARY_USAGE, HID_DEVICE_PROPERTY_PRIMARY_USAGE_PAGE,
-    HID_DEVICE_PROPERTY_PRODUCT,
-};
 use crate::Component;
+use crate::sys::inner::ffi::{
+    HID_DEVICE_PROPERTY_PRIMARY_USAGE, HID_DEVICE_PROPERTY_PRIMARY_USAGE_PAGE,
+    HID_DEVICE_PROPERTY_PRODUCT, IOHIDEventFieldBase, IOHIDEventGetFloatValue,
+    IOHIDEventSystemClientCreate, IOHIDEventSystemClientSetMatching, IOHIDServiceClientCopyEvent,
+    kHIDPage_AppleVendor, kHIDUsage_AppleVendor_TemperatureSensor, kIOHIDEventTypeTemperature,
+    kIOHIDSerialNumberKey,
+};
 
 pub(crate) struct ComponentsInner {
     pub(crate) components: Vec<Component>,
@@ -90,11 +90,17 @@ impl ComponentsInner {
             let services = CFRetained::cast_unchecked::<CFArray<IOHIDServiceClient>>(services);
 
             let key = CFString::from_static_str(HID_DEVICE_PROPERTY_PRODUCT);
+            let serial_key = CFString::from_static_str(kIOHIDSerialNumberKey);
 
             for service in services {
                 let Some(name) = service.property(&key) else {
                     continue;
                 };
+                let serial = service
+                    .property(&serial_key)
+                    .and_then(|value| value.downcast::<CFString>().ok())
+                    .as_deref()
+                    .map(CFString::to_string);
                 let name = name.downcast::<CFString>().unwrap();
                 let name_str = name.to_string();
 
@@ -108,7 +114,7 @@ impl ComponentsInner {
                     continue;
                 }
 
-                let mut component = ComponentInner::new(name_str, None, None, service);
+                let mut component = ComponentInner::new(serial, name_str, None, None, service);
                 component.refresh();
 
                 self.components.push(Component { inner: component });
@@ -118,6 +124,7 @@ impl ComponentsInner {
 }
 
 pub(crate) struct ComponentInner {
+    id: Option<String>,
     service: CFRetained<IOHIDServiceClient>,
     temperature: Option<f32>,
     label: String,
@@ -133,12 +140,14 @@ unsafe impl Sync for ComponentInner {}
 
 impl ComponentInner {
     pub(crate) fn new(
+        id: Option<String>,
         label: String,
         max: Option<f32>,
         critical: Option<f32>,
         service: CFRetained<IOHIDServiceClient>,
     ) -> Self {
         Self {
+            id,
             service,
             label,
             max: max.unwrap_or(0.),
@@ -162,6 +171,10 @@ impl ComponentInner {
 
     pub(crate) fn label(&self) -> &str {
         &self.label
+    }
+
+    pub(crate) fn id(&self) -> Option<&str> {
+        self.id.as_deref()
     }
 
     pub(crate) fn refresh(&mut self) {

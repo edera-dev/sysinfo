@@ -7,7 +7,8 @@
 use crate::Component;
 
 use std::collections::HashMap;
-use std::fs::{read_dir, File};
+use std::ffi::OsStr;
+use std::fs::{File, read_dir};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,10 @@ use std::path::{Path, PathBuf};
 pub(crate) struct ComponentInner {
     /// Optional associated device of a `Component`.
     device_model: Option<String>,
+
+    /// ID of a `Component`.
+    id: Option<String>,
+
     /// The chip name.
     ///
     /// Kernel documentation extract:
@@ -290,7 +295,12 @@ impl ComponentInner {
             });
             let component = &mut component.inner;
             let name = get_file_line(&folder.join("name"), 16);
+            let component_id = folder
+                .file_name()
+                .and_then(OsStr::to_str)
+                .map(|f| format!("{f}_{id}"));
             component.name = name.unwrap_or_default();
+            component.id = component_id;
             let device_model = get_file_line(&folder.join("device/model"), 16);
             component.device_model = device_model;
             fill_component(component, item, folder, filename);
@@ -353,6 +363,10 @@ impl ComponentInner {
         &self.label
     }
 
+    pub(crate) fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
     pub(crate) fn refresh(&mut self) {
         let current = self
             .input_file
@@ -373,7 +387,7 @@ impl ComponentInner {
     }
 }
 
-fn read_temp_dir<F: FnMut(PathBuf)>(path: &str, starts_with: &str, mut f: F) {
+fn read_temp_dir<F: FnMut(PathBuf)>(path: &Path, starts_with: &str, mut f: F) {
     if let Ok(dir) = read_dir(path) {
         for entry in dir.flatten() {
             if !entry
@@ -420,25 +434,25 @@ impl ComponentsInner {
     }
 
     pub(crate) fn refresh(&mut self) {
-        self.refresh_from_sys_class_path("/sys/class");
+        self.refresh_from_sys_class_path(Path::new("/sys/class"));
     }
 
-    fn refresh_from_sys_class_path(&mut self, path: &str) {
-        let hwmon_path = format!("{path}/hwmon");
-        read_temp_dir(&hwmon_path, "hwmon", |path| {
+    fn refresh_from_sys_class_path(&mut self, path: &Path) {
+        read_temp_dir(&path.join("hwmon"), "hwmon", |path| {
             ComponentInner::from_hwmon(&mut self.components, &path);
         });
         if self.components.is_empty() {
             // Normally should only be used by raspberry pi.
-            let thermal_path = format!("{path}/thermal");
-            read_temp_dir(&thermal_path, "thermal_", |path| {
+            read_temp_dir(&path.join("thermal"), "thermal_", |path| {
                 let temp = path.join("temp");
                 if temp.exists() {
                     let Some(name) = get_file_line(&path.join("type"), 16) else {
                         return;
                     };
+                    let component_id = path.file_name().and_then(OsStr::to_str).map(str::to_string);
                     let mut component = ComponentInner {
                         name,
+                        id: component_id,
                         ..Default::default()
                     };
                     fill_component(&mut component, "input", &path, "temp");
@@ -468,18 +482,14 @@ mod tests {
             .expect("failed to write to temp1_input file");
 
         let mut components = ComponentsInner::new();
-        components.refresh_from_sys_class_path(
-            temp_dir
-                .path()
-                .to_str()
-                .expect("failed to convert path to string"),
-        );
+        components.refresh_from_sys_class_path(temp_dir.path());
         let components = components.into_vec();
 
         assert_eq!(components.len(), 1);
         assert_eq!(components[0].inner.name, "test_name");
         assert_eq!(components[0].label(), "test_name temp1");
         assert_eq!(components[0].temperature(), Some(1.234));
+        assert_eq!(components[0].id(), Some("hwmon0_1"));
     }
 
     #[test]
@@ -502,12 +512,7 @@ mod tests {
         fs::write(hwmon0_dir.join("temp1_crit"), "100").expect("failed to write to temp1_min file");
 
         let mut components = ComponentsInner::new();
-        components.refresh_from_sys_class_path(
-            temp_dir
-                .path()
-                .to_str()
-                .expect("failed to convert path to string"),
-        );
+        components.refresh_from_sys_class_path(temp_dir.path());
         let components = components.into_vec();
 
         assert_eq!(components.len(), 1);
@@ -516,6 +521,7 @@ mod tests {
         assert_eq!(components[0].temperature(), Some(1.234));
         assert_eq!(components[0].max(), Some(1.234));
         assert_eq!(components[0].critical(), Some(0.1));
+        assert_eq!(components[0].id(), Some("hwmon0_1"));
     }
 
     #[test]
@@ -539,12 +545,7 @@ mod tests {
         fs::write(hwmon0_dir.join("temp2_crit"), "200").expect("failed to write to temp2_min file");
 
         let mut components = ComponentsInner::new();
-        components.refresh_from_sys_class_path(
-            temp_dir
-                .path()
-                .to_str()
-                .expect("failed to convert path to string"),
-        );
+        components.refresh_from_sys_class_path(temp_dir.path());
         let mut components = components.into_vec();
         components.sort_by_key(|c| c.inner.label.clone());
 
@@ -553,12 +554,14 @@ mod tests {
         assert_eq!(components[0].label(), "test_name test_label1");
         assert_eq!(components[0].temperature(), Some(1.234));
         assert_eq!(components[0].max(), Some(1.234));
+        assert_eq!(components[0].id(), Some("hwmon0_1"));
         assert_eq!(components[0].critical(), Some(0.1));
 
         assert_eq!(components[1].inner.name, "test_name");
         assert_eq!(components[1].label(), "test_name test_label2");
         assert_eq!(components[1].temperature(), Some(5.678));
         assert_eq!(components[1].max(), Some(5.678));
+        assert_eq!(components[1].id(), Some("hwmon0_2"));
         assert_eq!(components[1].critical(), Some(0.2));
     }
 
@@ -588,12 +591,7 @@ mod tests {
         fs::write(hwmon0_dir.join("temp2_crit"), "200").expect("failed to write to temp2_min file");
 
         let mut components = ComponentsInner::new();
-        components.refresh_from_sys_class_path(
-            temp_dir
-                .path()
-                .to_str()
-                .expect("failed to convert path to string"),
-        );
+        components.refresh_from_sys_class_path(temp_dir.path());
         let mut components = components.into_vec();
         components.sort_by_key(|c| c.inner.label.clone());
 
@@ -603,11 +601,54 @@ mod tests {
         assert_eq!(components[0].temperature(), Some(1.234));
         assert_eq!(components[0].max(), Some(1.234));
         assert_eq!(components[0].critical(), Some(0.1));
+        assert_eq!(components[0].id(), Some("hwmon0_1"));
 
         assert_eq!(components[1].inner.name, "test_name");
         assert_eq!(components[1].label(), "test_name test_label2 test_model");
         assert_eq!(components[1].temperature(), Some(5.678));
         assert_eq!(components[1].max(), Some(5.678));
         assert_eq!(components[1].critical(), Some(0.2));
+        assert_eq!(components[1].id(), Some("hwmon0_2"));
+    }
+
+    #[test]
+    fn test_thermal_zone() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temporary directory");
+        let thermal_zone0_dir = temp_dir.path().join("thermal/thermal_zone0");
+        let thermal_zone1_dir = temp_dir.path().join("thermal/thermal_zone1");
+
+        // create thermal zone files
+        fs::create_dir_all(thermal_zone0_dir.join("device"))
+            .expect("failed to create thermal/thermal_zone0 directory");
+
+        fs::write(thermal_zone0_dir.join("type"), "test_name")
+            .expect("failed to write to name file");
+        fs::write(thermal_zone0_dir.join("temp"), "1234").expect("failed to write to temp file");
+
+        // create thermal zone files
+        fs::create_dir_all(thermal_zone1_dir.join("device"))
+            .expect("failed to create thermal/thermal_zone1 directory");
+
+        fs::write(thermal_zone1_dir.join("type"), "test_name2")
+            .expect("failed to write to name file");
+        fs::write(thermal_zone1_dir.join("temp"), "5678").expect("failed to write to temp file");
+
+        let mut components = ComponentsInner::new();
+        components.refresh_from_sys_class_path(temp_dir.path());
+        let mut components = components.into_vec();
+        components.sort_by_key(|c| c.inner.name.clone());
+
+        assert_eq!(components.len(), 2);
+        assert_eq!(components[0].inner.name, "test_name");
+        assert_eq!(components[0].label(), "");
+        assert_eq!(components[0].temperature(), Some(1.234));
+        assert_eq!(components[0].max(), Some(1.234));
+        assert_eq!(components[0].id(), Some("thermal_zone0"));
+
+        assert_eq!(components[1].inner.name, "test_name2");
+        assert_eq!(components[1].label(), "");
+        assert_eq!(components[1].temperature(), Some(5.678));
+        assert_eq!(components[1].max(), Some(5.678));
+        assert_eq!(components[1].id(), Some("thermal_zone1"));
     }
 }

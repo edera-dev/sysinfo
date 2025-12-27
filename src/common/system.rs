@@ -7,8 +7,8 @@ use std::path::Path;
 use std::process::ExitStatus;
 use std::str::FromStr;
 
-use crate::common::impl_get_set::impl_get_set;
 use crate::common::DiskUsage;
+use crate::common::impl_get_set::impl_get_set;
 use crate::{CpuInner, Gid, MotherboardInner, ProcessInner, ProductInner, SystemInner, Uid};
 
 /// Type containing system's information such as processes, memory and CPU.
@@ -230,7 +230,8 @@ impl System {
         self.inner.refresh_cpu_list(refresh_kind);
     }
 
-    /// Refreshes all information related to CPUs information.
+    /// Refreshes all information related to CPUs information. It does not refresh the CPU list.
+    /// If you want to refresh the CPU list, use [`System::refresh_cpu_list`] instead.
     ///
     /// If you only want the CPU usage, use [`System::refresh_cpu_usage`] instead.
     ///
@@ -254,7 +255,8 @@ impl System {
         self.refresh_cpu_specifics(CpuRefreshKind::everything())
     }
 
-    /// Refreshes CPUs specific information.
+    /// Refreshes CPUs specific information. It does not refresh the CPU list.
+    /// If you want to refresh the CPU list, use [`System::refresh_cpu_list`] instead.
     ///
     /// ```no_run
     /// use sysinfo::{System, CpuRefreshKind};
@@ -293,7 +295,7 @@ impl System {
     ///
     /// ⚠️ On Linux, if you dont need the tasks of each process, you can use
     /// `refresh_processes_specifics` with `ProcessRefreshKind::everything().without_tasks()`.
-    /// Refreshesing all processes and their tasks can be quite expensive. For more information
+    /// Refreshing all processes and their tasks can be quite expensive. For more information
     /// see [`ProcessRefreshKind`].
     ///
     /// Example:
@@ -359,10 +361,10 @@ impl System {
             }
         }
         fn update(pid: &Pid, processes: &mut HashMap<Pid, Process>) {
-            if let Some(proc) = processes.get_mut(pid) {
-                if !proc.inner.switch_updated() {
-                    proc.inner.set_nonexistent();
-                }
+            if let Some(proc) = processes.get_mut(pid)
+                && !proc.inner.switch_updated()
+            {
+                proc.inner.set_nonexistent();
             }
         }
 
@@ -2971,23 +2973,26 @@ mod test {
 
         s.refresh_processes(ProcessesToUpdate::All, false);
         // All CPU usage will start at zero until the second refresh
-        assert!(s
-            .processes()
-            .iter()
-            .all(|(_, proc_)| proc_.cpu_usage() == 0.0));
+        assert!(
+            s.processes()
+                .iter()
+                .all(|(_, proc_)| proc_.cpu_usage() == 0.0)
+        );
 
         // Wait a bit to update CPU usage values
         std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
         s.refresh_processes(ProcessesToUpdate::All, true);
-        assert!(s
-            .processes()
-            .iter()
-            .all(|(_, proc_)| proc_.cpu_usage() >= 0.0
-                && proc_.cpu_usage() <= (s.cpus().len() as f32) * 100.0));
-        assert!(s
-            .processes()
-            .iter()
-            .any(|(_, proc_)| proc_.cpu_usage() > 0.0));
+        assert!(
+            s.processes()
+                .iter()
+                .all(|(_, proc_)| proc_.cpu_usage() >= 0.0
+                    && proc_.cpu_usage() <= (s.cpus().len() as f32) * 100.0)
+        );
+        assert!(
+            s.processes()
+                .iter()
+                .any(|(_, proc_)| proc_.cpu_usage() > 0.0)
+        );
     }
 
     #[test]
@@ -3012,21 +3017,29 @@ mod test {
     fn check_system_info() {
         // We don't want to test on unsupported systems.
         if IS_SUPPORTED_SYSTEM {
-            assert!(!System::name()
-                .expect("Failed to get system name")
-                .is_empty());
+            assert!(
+                !System::name()
+                    .expect("Failed to get system name")
+                    .is_empty()
+            );
 
-            assert!(!System::kernel_version()
-                .expect("Failed to get kernel version")
-                .is_empty());
+            assert!(
+                !System::kernel_version()
+                    .expect("Failed to get kernel version")
+                    .is_empty()
+            );
 
-            assert!(!System::os_version()
-                .expect("Failed to get os version")
-                .is_empty());
+            assert!(
+                !System::os_version()
+                    .expect("Failed to get os version")
+                    .is_empty()
+            );
 
-            assert!(!System::long_os_version()
-                .expect("Failed to get long OS version")
-                .is_empty());
+            assert!(
+                !System::long_os_version()
+                    .expect("Failed to get long OS version")
+                    .is_empty()
+            );
         }
 
         assert!(!System::distribution_id().is_empty());
