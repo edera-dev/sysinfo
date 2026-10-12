@@ -5,41 +5,7 @@ use std::ffi::{CStr, OsStr, OsString};
 #[cfg(feature = "system")]
 use std::os::unix::ffi::OsStrExt;
 
-#[cfg(feature = "system")]
-#[inline]
-pub unsafe fn init_mib(name: &[u8], mib: &mut [libc::c_int]) {
-    let mut len = mib.len();
-    unsafe {
-        libc::sysctlnametomib(name.as_ptr() as _, mib.as_mut_ptr(), &mut len);
-    }
-}
-
-#[cfg(feature = "system")]
-pub(crate) fn boot_time() -> u64 {
-    let mut boot_time = libc::timeval {
-        tv_sec: 0,
-        tv_usec: 0,
-    };
-    let mut len = std::mem::size_of::<libc::timeval>();
-    let mut mib: [libc::c_int; 2] = [libc::CTL_KERN, libc::KERN_BOOTTIME];
-    unsafe {
-        if libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as _,
-            &mut boot_time as *mut libc::timeval as *mut _,
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        ) < 0
-        {
-            0
-        } else {
-            boot_time.tv_sec as _
-        }
-    }
-}
-
-#[cfg(any(feature = "system", feature = "network"))]
+#[cfg(any(feature = "system", feature = "component"))]
 pub(crate) unsafe fn get_sys_value<T: Sized>(mib: &[libc::c_int], value: &mut T) -> bool {
     let mut len = std::mem::size_of::<T>() as libc::size_t;
     unsafe {
@@ -69,7 +35,7 @@ pub(crate) unsafe fn get_sys_value_array<T: Sized>(mib: &[libc::c_int], value: &
     }
 }
 
-#[cfg(any(feature = "disk", feature = "system", feature = "network"))]
+#[cfg(any(feature = "disk", feature = "system"))]
 pub(crate) fn c_buf_to_utf8_str(buf: &[libc::c_char]) -> Option<&str> {
     unsafe {
         let buf: &[u8] = std::slice::from_raw_parts(buf.as_ptr() as _, buf.len());
@@ -83,7 +49,7 @@ pub(crate) fn c_buf_to_utf8_str(buf: &[libc::c_char]) -> Option<&str> {
     }
 }
 
-#[cfg(any(feature = "disk", feature = "system", feature = "network"))]
+#[cfg(feature = "system")]
 pub(crate) fn c_buf_to_utf8_string(buf: &[libc::c_char]) -> Option<String> {
     c_buf_to_utf8_str(buf).map(|s| s.to_owned())
 }
@@ -106,31 +72,26 @@ pub(crate) fn c_buf_to_os_string(buf: &[libc::c_char]) -> OsString {
     c_buf_to_os_str(buf).to_owned()
 }
 
-#[cfg(feature = "system")]
+#[cfg(feature = "disk")]
 pub(crate) unsafe fn get_sysctl_raw(
     mib: &[libc::c_int],
     data: *mut (),
     len: &mut libc::size_t,
-) -> Option<()> {
+) -> bool {
     unsafe {
-        if libc::sysctl(
+        libc::sysctl(
             mib.as_ptr(),
             mib.len() as _,
             data as _,
             len,
             std::ptr::null_mut(),
             0,
-        ) != 0
-        {
-            None
-        } else {
-            Some(())
-        }
+        ) == 0
     }
 }
 
 #[cfg(feature = "system")]
-pub(crate) unsafe fn get_sys_value_str(
+pub(crate) unsafe fn get_sys_value_osstr(
     mib: &[libc::c_int],
     buf: &mut [libc::c_char],
 ) -> Option<OsString> {
@@ -153,6 +114,42 @@ pub(crate) unsafe fn get_sys_value_str(
     ))
 }
 
+#[cfg(feature = "system")]
+pub(crate) unsafe fn get_sys_value_str(mib: &[libc::c_int]) -> Option<String> {
+    let mut size = 0;
+
+    unsafe {
+        if libc::sysctl(
+            mib.as_ptr(),
+            mib.len() as _,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+        {
+            return None;
+        }
+        // now create a buffer with the size and get the real value
+        let mut buf: Vec<libc::c_char> = vec![0; size as _];
+
+        if libc::sysctl(
+            mib.as_ptr(),
+            mib.len() as _,
+            buf.as_mut_ptr() as *mut _,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) == 0
+            && size > 0
+        {
+            c_buf_to_utf8_string(&buf)
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(any(feature = "system", feature = "component"))]
 pub(crate) unsafe fn get_sys_value_by_name<T: Sized>(name: &[u8], value: &mut T) -> bool {
     let mut len = std::mem::size_of::<T>() as libc::size_t;
@@ -170,7 +167,7 @@ pub(crate) unsafe fn get_sys_value_by_name<T: Sized>(name: &[u8], value: &mut T)
     }
 }
 
-#[cfg(any(feature = "system", feature = "disk"))]
+#[cfg(feature = "system")]
 pub(crate) fn get_sys_value_str_by_name(name: &[u8]) -> Option<String> {
     let mut size = 0;
 
@@ -198,10 +195,15 @@ pub(crate) fn get_sys_value_str_by_name(name: &[u8]) -> Option<String> {
             {
                 c_buf_to_utf8_string(&buf)
             } else {
+                sysinfo_debug!(
+                    "failed to get value for key {:?}",
+                    std::str::from_utf8(name)
+                );
                 // getting the system value failed
                 None
             }
         } else {
+            sysinfo_debug!("no value for key {:?}", std::str::from_utf8(name));
             None
         }
     }
@@ -238,24 +240,17 @@ pub(crate) unsafe fn from_cstr_array(ptr: *const *const libc::c_char) -> Vec<OsS
 
 #[cfg(any(feature = "system", feature = "component"))]
 pub(crate) unsafe fn get_nb_cpus() -> usize {
-    let mut smp: libc::c_int = 0;
-    let mut nb_cpus: libc::c_int = 1;
+    let mut nb_cpus: libc::c_int = 0;
 
     unsafe {
-        if !get_sys_value_by_name(b"kern.smp.active\0", &mut smp) {
-            smp = 0;
-        }
-        #[allow(clippy::collapsible_if)] // I keep as is for readability reasons.
-        if smp != 0 {
-            if !get_sys_value_by_name(b"kern.smp.cpus\0", &mut nb_cpus) || nb_cpus < 1 {
-                nb_cpus = 1;
-            }
+        if !get_sys_value(&[libc::CTL_HW, super::ffi::HW_NCPUONLINE], &mut nb_cpus) || nb_cpus < 1 {
+            nb_cpus = 1;
         }
     }
     nb_cpus as usize
 }
 
-// All this is needed because `kinfo_proc` doesn't implement `Send` (because it contains pointers).
+// All this is needed because `kinfo_proc2` doesn't implement `Send` (because it contains pointers).
 #[cfg(feature = "system")]
 pub(crate) struct WrapMap<'a>(
     pub std::cell::UnsafeCell<&'a mut std::collections::HashMap<crate::Pid, crate::Process>>,
@@ -268,7 +263,7 @@ unsafe impl Sync for WrapMap<'_> {}
 
 #[cfg(feature = "system")]
 #[repr(transparent)]
-pub(crate) struct KInfoProc(libc::kinfo_proc);
+pub(crate) struct KInfoProc(libc::kinfo_proc2);
 
 #[cfg(feature = "system")]
 unsafe impl Send for KInfoProc {}
@@ -277,32 +272,9 @@ unsafe impl Sync for KInfoProc {}
 
 #[cfg(feature = "system")]
 impl std::ops::Deref for KInfoProc {
-    type Target = libc::kinfo_proc;
+    type Target = libc::kinfo_proc2;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
-}
-
-#[cfg(feature = "system")]
-// Get the value of a kernel environment variable.
-pub(crate) fn get_kenv_var(name: &[u8]) -> Option<String> {
-    let mut buf: [libc::c_char; libc::KENV_MVALLEN as usize] = [0; libc::KENV_MVALLEN as usize];
-
-    let size = unsafe {
-        libc::kenv(
-            libc::KENV_GET as _,
-            name.as_ptr() as _,
-            buf.as_mut_ptr() as _,
-            buf.len() as _,
-        ) as isize
-    };
-
-    // returns a strictly negative number in case of error
-    // (see: https://man.freebsd.org/cgi/man.cgi?query=kenv&sektion=2&manpath=FreeBSD+15.0-CURRENT)
-    if size < 0 {
-        return None;
-    }
-
-    c_buf_to_utf8_string(&buf[..size as usize])
 }

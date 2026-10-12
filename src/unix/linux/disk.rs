@@ -38,7 +38,7 @@ pub(crate) struct DiskInner {
     type_: DiskKind,
     device_name: OsString,
     actual_device_name: Option<String>,
-    file_system: OsString,
+    pub(crate) file_system: OsString,
     mount_point: PathBuf,
     total_space: u64,
     available_space: u64,
@@ -49,6 +49,28 @@ pub(crate) struct DiskInner {
     written_bytes: u64,
     read_bytes: u64,
     updated: bool,
+}
+
+#[cfg(test)]
+impl Default for DiskInner {
+    fn default() -> Self {
+        Self {
+            type_: DiskKind::Unknown(0),
+            device_name: OsString::new(),
+            actual_device_name: None,
+            file_system: OsString::new(),
+            mount_point: PathBuf::new(),
+            total_space: 0,
+            available_space: 0,
+            is_removable: false,
+            is_read_only: false,
+            old_written_bytes: 0,
+            old_read_bytes: 0,
+            written_bytes: 0,
+            read_bytes: 0,
+            updated: false,
+        }
+    }
 }
 
 impl DiskInner {
@@ -213,14 +235,14 @@ unsafe fn load_statvfs_values(mount_point: &Path) -> Option<(u64, u64, bool)> {
     {
         let stat = unsafe { stat.assume_init() };
 
-        let bsize = cast!(stat.f_bsize);
+        let frsize = cast!(stat.f_frsize);
         let blocks = cast!(stat.f_blocks);
         let bavail = cast!(stat.f_bavail);
-        let total = bsize.saturating_mul(blocks);
+        let total = frsize.saturating_mul(blocks);
         if total == 0 {
             return None;
         }
-        let available = bsize.saturating_mul(bavail);
+        let available = frsize.saturating_mul(bavail);
         let is_read_only = (stat.f_flag & libc::ST_RDONLY) != 0;
 
         Some((total, available, is_read_only))

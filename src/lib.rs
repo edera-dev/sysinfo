@@ -25,18 +25,19 @@
 #[macro_use]
 mod macros;
 
-cfg_if! {
-    if #[cfg(feature = "unknown-ci")] {
+cfg_select! {
+    feature = "unknown-ci" => {
         // This is used in CI to check that the build for unknown targets is compiling fine.
         mod unknown;
         use crate::unknown as sys;
 
         #[cfg(test)]
         pub(crate) const MIN_USERS: usize = 0;
-    } else if #[cfg(any(
+    }
+    any(
         target_os = "macos", target_os = "ios",
         target_os = "linux", target_os = "android",
-        target_os = "freebsd"))]
+        target_os = "freebsd", target_os = "netbsd") =>
     {
         mod unix;
         use crate::unix::sys as sys;
@@ -48,7 +49,8 @@ cfg_if! {
 
         #[cfg(test)]
         pub(crate) const MIN_USERS: usize = 1;
-    } else if #[cfg(windows)] {
+    }
+    windows => {
         mod windows;
         use crate::windows as sys;
 
@@ -59,7 +61,8 @@ cfg_if! {
 
         #[cfg(test)]
         pub(crate) const MIN_USERS: usize = 1;
-    } else {
+    }
+    _ => {
         mod unknown;
         use crate::unknown as sys;
 
@@ -74,7 +77,8 @@ pub use crate::common::component::{Component, Components};
 pub use crate::common::disk::{Disk, DiskKind, DiskRefreshKind, Disks};
 #[cfg(feature = "network")]
 pub use crate::common::network::{
-    IpNetwork, IpNetworkFromStrError, MacAddr, MacAddrFromStrError, NetworkData, Networks,
+    InterfaceOperationalState, IpNetwork, IpNetworkFromStrError, MacAddr, MacAddrFromStrError,
+    NetworkData, Networks,
 };
 #[cfg(feature = "system")]
 pub use crate::common::system::{
@@ -153,8 +157,8 @@ mod windows;
 /// let s = System::new_all();
 /// ```
 pub fn set_open_files_limit(mut _new_limit: usize) -> bool {
-    cfg_if! {
-        if #[cfg(all(feature = "system", not(feature = "unknown-ci"), any(target_os = "linux", target_os = "android")))]
+    cfg_select! {
+        all(feature = "system", not(feature = "unknown-ci"), any(target_os = "linux", target_os = "android")) =>
         {
             use crate::sys::system::remaining_files;
             use std::sync::atomic::Ordering;
@@ -167,14 +171,17 @@ pub fn set_open_files_limit(mut _new_limit: usize) -> bool {
             // If files are already open, to be sure that the number won't be bigger when those
             // files are closed, we subtract the current number of opened files to the new
             // limit.
-            remaining_files().fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            if remaining_files().fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                 let _new_limit = _new_limit as isize;
                 let diff = (max as isize).saturating_sub(remaining);
                 Some(_new_limit.saturating_sub(diff))
-            }).unwrap();
+            }).is_err() {
+                sysinfo_debug!("failed to update open files limit");
+            }
 
             true
-        } else {
+        }
+        _ => {
             false
         }
     }
@@ -314,8 +321,8 @@ mod test {
                     ));
                 assert!(
                     s.processes()
-                        .iter()
-                        .filter_map(|(_, p)| p.user_id())
+                        .values()
+                        .filter_map(|p| p.user_id())
                         .any(|uid| users.get_user_by_id(uid).is_some())
                 );
             }

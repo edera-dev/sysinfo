@@ -15,9 +15,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use libc::{c_ulong, gid_t, uid_t};
 
 use crate::sys::system::SystemInfo;
-use crate::sys::utils::{
-    PathHandler, PathPush, get_all_data_from_file, get_all_utf8_data, realpath,
-};
+use crate::sys::utils::{PathHandler, PathPush, get_all_data_from_file, get_all_utf8_data};
+use crate::unix::utils::realpath;
 use crate::{
     DiskUsage, Gid, Pid, Process, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, Signal,
     ThreadKind, Uid,
@@ -191,6 +190,10 @@ impl ProcessInner {
 
     pub(crate) fn pid(&self) -> Pid {
         self.pid
+    }
+
+    pub(crate) fn cgroup_limits(&self) -> Option<crate::CGroupLimits> {
+        crate::sys::cgroup::limits_for_process(&self.proc_path)
     }
 
     pub(crate) fn environ(&self) -> &[OsString] {
@@ -411,7 +414,11 @@ unsafe impl<T> Sync for Wrap<'_, T> {}
 
 #[inline(always)]
 fn start_time_raw(parts: &Parts<'_>) -> u64 {
-    u64::from_str(parts.str_parts[ProcIndex::StartTime as usize]).unwrap_or(0)
+    parts
+        .str_parts
+        .get(ProcIndex::StartTime as usize)
+        .and_then(|part| u64::from_str(part).ok())
+        .unwrap_or(0)
 }
 
 #[inline(always)]
@@ -462,6 +469,15 @@ fn refresh_user_group_ids(
     }
 }
 
+/// Only overwrite if the new value is `Some` or the old value was `None`,
+/// to avoid wiping previously-read data if the process terminated mid-refresh.
+fn update_optional_path(target: &mut Option<PathBuf>, path: &std::path::Path) {
+    let new_val = realpath(path);
+    if new_val.is_some() || target.is_none() {
+        *target = new_val;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn update_proc_info(
     p: &mut ProcessInner,
@@ -474,40 +490,50 @@ fn update_proc_info(
 ) {
     update_parent_pid(p, parent_pid, str_parts);
 
-    get_status(p, str_parts[ProcIndex::State as usize]);
+    get_status(p, str_parts.get(ProcIndex::State as usize).unwrap_or(&""));
     refresh_user_group_ids(p, proc_path, refresh_kind);
 
     if refresh_kind.exe().needs_update(|| p.exe.is_none()) {
         // Do not use cmd[0] because it is not the same thing.
         // See https://github.com/GuillaumeGomez/sysinfo/issues/697.
-        p.exe = realpath(proc_path.replace_and_join("exe"));
-        // If the target executable file was modified or removed, linux appends ` (deleted)` at
-        // the end. We need to remove it.
-        // See https://github.com/GuillaumeGomez/sysinfo/issues/1585.
-        let deleted = b" (deleted)";
-        if let Some(exe) = &mut p.exe
-            && let Some(file_name) = exe.file_name()
-            && file_name.as_encoded_bytes().ends_with(deleted)
-        {
-            let mut file_name = file_name.as_encoded_bytes().to_vec();
-            file_name.truncate(file_name.len() - deleted.len());
-            unsafe {
-                exe.set_file_name(OsString::from_encoded_bytes_unchecked(file_name));
+        let new_exe = realpath(proc_path.replace_and_join("exe"));
+        // Avoid overwriting with None if the process terminated mid-refresh.
+        if new_exe.is_some() || p.exe.is_none() {
+            p.exe = new_exe;
+            // If the target executable file was modified or removed, linux appends ` (deleted)`
+            // at the end. We need to remove it.
+            // See https://github.com/GuillaumeGomez/sysinfo/issues/1585.
+            let deleted = b" (deleted)";
+            if let Some(exe) = &mut p.exe
+                && let Some(file_name) = exe.file_name()
+                && file_name.as_encoded_bytes().ends_with(deleted)
+            {
+                let mut file_name = file_name.as_encoded_bytes().to_vec();
+                file_name.truncate(file_name.len() - deleted.len());
+                unsafe {
+                    exe.set_file_name(OsString::from_encoded_bytes_unchecked(file_name));
+                }
             }
         }
     }
 
     if refresh_kind.cmd().needs_update(|| p.cmd.is_empty()) {
-        p.cmd = copy_from_file(proc_path.replace_and_join("cmdline"));
+        let new_cmd = copy_from_file(proc_path.replace_and_join("cmdline"));
+        if !new_cmd.is_empty() || p.cmd.is_empty() {
+            p.cmd = new_cmd;
+        }
     }
     if refresh_kind.environ().needs_update(|| p.environ.is_empty()) {
-        p.environ = copy_from_file(proc_path.replace_and_join("environ"));
+        let new_environ = copy_from_file(proc_path.replace_and_join("environ"));
+        if !new_environ.is_empty() || p.environ.is_empty() {
+            p.environ = new_environ;
+        }
     }
     if refresh_kind.cwd().needs_update(|| p.cwd.is_none()) {
-        p.cwd = realpath(proc_path.replace_and_join("cwd"));
+        update_optional_path(&mut p.cwd, proc_path.replace_and_join("cwd"));
     }
     if refresh_kind.root().needs_update(|| p.root.is_none()) {
-        p.root = realpath(proc_path.replace_and_join("root"));
+        update_optional_path(&mut p.root, proc_path.replace_and_join("root"));
     }
 
     update_time_and_memory(proc_path, p, str_parts, uptime, info, refresh_kind);
@@ -527,14 +553,19 @@ fn update_proc_info(
 fn update_parent_pid(p: &mut ProcessInner, parent_pid: Option<Pid>, str_parts: &[&str]) {
     p.parent = match parent_pid {
         Some(parent_pid) if parent_pid.0 != 0 => Some(parent_pid),
-        _ => match Pid::from_str(str_parts[ProcIndex::ParentPid as usize]) {
-            Ok(p) if p.0 != 0 => Some(p),
+        _ => match str_parts
+            .get(ProcIndex::ParentPid as usize)
+            .and_then(|part| Pid::from_str(part).ok())
+        {
+            Some(p) if p.0 != 0 => Some(p),
             _ => None,
         },
     };
 }
 
+#[allow(clippy::too_many_arguments)]
 fn retrieve_all_new_process_info(
+    is_thread: bool,
     pid: Pid,
     parent_pid: Option<Pid>,
     parts: &Parts<'_>,
@@ -556,12 +587,11 @@ fn retrieve_all_new_process_info(
         .saturating_add(info.boot_time);
 
     p.name = OsStr::from_bytes(name).to_os_string();
-    if c_ulong::from_str(parts.str_parts[ProcIndex::Flags as usize])
-        .map(|flags| flags & libc::PF_KTHREAD as c_ulong != 0)
-        .unwrap_or(false)
+    if let Some(part) = parts.str_parts.get(ProcIndex::Flags as usize)
+        && c_ulong::from_str(part).is_ok_and(|flags| flags & libc::PF_KTHREAD as c_ulong != 0)
     {
         p.thread_kind = Some(ThreadKind::Kernel);
-    } else if parent_pid.is_some() {
+    } else if is_thread {
         p.thread_kind = Some(ThreadKind::Userland);
     }
 
@@ -579,6 +609,7 @@ fn retrieve_all_new_process_info(
 }
 
 fn update_existing_process(
+    is_thread: bool,
     proc: &mut Process,
     parent_pid: Option<Pid>,
     uptime: u64,
@@ -614,6 +645,12 @@ fn update_existing_process(
     if start_time_raw == entry.start_time_raw {
         let mut proc_path = PathHandler::new(&entry.proc_path);
 
+        // If the entry was first discovered without thread info
+        // (e.g. in ProcessesToUpdate::All mode), fix its thread_kind now.
+        if is_thread && entry.thread_kind.is_none() {
+            entry.thread_kind = Some(ThreadKind::Userland);
+        }
+
         update_proc_info(
             entry,
             parent_pid,
@@ -629,6 +666,7 @@ fn update_existing_process(
     }
     // If we're here, it means that the PID still exists but it's a different process.
     let p = retrieve_all_new_process_info(
+        is_thread,
         entry.pid,
         parent_pid,
         &parts,
@@ -647,6 +685,7 @@ pub(crate) fn _get_process_data(
     path: &Path,
     proc_list: &mut HashMap<Pid, Process>,
     pid: Pid,
+    is_thread: bool,
     parent_pid: Option<Pid>,
     uptime: u64,
     info: &SystemInfo,
@@ -654,14 +693,30 @@ pub(crate) fn _get_process_data(
     tasks: Option<HashSet<Pid>>,
 ) -> Result<Option<Process>, ()> {
     if let Some(ref mut entry) = proc_list.get_mut(&pid) {
-        return update_existing_process(entry, parent_pid, uptime, info, refresh_kind, tasks);
+        return update_existing_process(
+            is_thread,
+            entry,
+            parent_pid,
+            uptime,
+            info,
+            refresh_kind,
+            tasks,
+        );
     }
     let mut stat_file = None;
     let data = _get_stat_data(path, &mut stat_file)?;
     let parts = parse_stat_file(&data).ok_or(())?;
 
-    let mut new_process =
-        retrieve_all_new_process_info(pid, parent_pid, &parts, path, info, refresh_kind, uptime);
+    let mut new_process = retrieve_all_new_process_info(
+        is_thread,
+        pid,
+        parent_pid,
+        &parts,
+        path,
+        info,
+        refresh_kind,
+        uptime,
+    );
     new_process.inner.stat_file = stat_file;
     new_process.inner.tasks = tasks;
     Ok(Some(new_process))
@@ -669,12 +724,17 @@ pub(crate) fn _get_process_data(
 
 fn old_get_memory(entry: &mut ProcessInner, str_parts: &[&str], info: &SystemInfo) {
     // rss
-    entry.memory = u64::from_str(str_parts[ProcIndex::ResidentSetSize as usize])
+    entry.memory = str_parts
+        .get(ProcIndex::ResidentSetSize as usize)
+        .and_then(|part| u64::from_str(part).ok())
         .unwrap_or(0)
         .saturating_mul(info.page_size_b);
     // vsz correspond to the Virtual memory size in bytes.
     // see: https://man7.org/linux/man-pages/man5/proc.5.html
-    entry.virtual_memory = u64::from_str(str_parts[ProcIndex::VirtualSize as usize]).unwrap_or(0);
+    entry.virtual_memory = str_parts
+        .get(ProcIndex::VirtualSize as usize)
+        .and_then(|part| u64::from_str(part).ok())
+        .unwrap_or(0);
 }
 
 fn slice_to_nb(s: &[u8]) -> u64 {
@@ -738,8 +798,14 @@ fn update_time_and_memory(
         }
         set_time(
             entry,
-            u64::from_str(str_parts[ProcIndex::UserTime as usize]).unwrap_or(0),
-            u64::from_str(str_parts[ProcIndex::SystemTime as usize]).unwrap_or(0),
+            str_parts
+                .get(ProcIndex::UserTime as usize)
+                .and_then(|part| u64::from_str(part).ok())
+                .unwrap_or(0),
+            str_parts
+                .get(ProcIndex::SystemTime as usize)
+                .and_then(|part| u64::from_str(part).ok())
+                .unwrap_or(0),
         );
         entry.run_time = uptime.saturating_sub(entry.start_time_without_boot_time);
     }
@@ -750,6 +816,7 @@ struct ProcAndTasks {
     parent_pid: Option<Pid>,
     path: PathBuf,
     tasks: Option<HashSet<Pid>>,
+    is_thread: bool,
 }
 
 #[cfg(feature = "multithread")]
@@ -821,6 +888,7 @@ pub(crate) fn refresh_procs(
                     e.path.as_path(),
                     proc_list,
                     e.pid,
+                    e.is_thread,
                     e.parent_pid,
                     uptime,
                     info,
@@ -859,6 +927,7 @@ fn get_proc_and_tasks(
     processes_to_update: ProcessesToUpdate<'_>,
 ) -> Vec<ProcAndTasks> {
     let mut parent_pid = None;
+    let mut is_thread = false;
     let (mut procs, mut tasks) = if refresh_kind.tasks() {
         let procs = get_proc_tasks(&path, pid);
         let tasks = procs.iter().map(|ProcAndTasks { pid, .. }| *pid).collect();
@@ -868,20 +937,23 @@ fn get_proc_and_tasks(
         (Vec::new(), None)
     };
 
-    if processes_to_update != ProcessesToUpdate::All {
-        // If the process' tgid doesn't match its pid, it is a task
-        if let Some(tgid) = get_tgid(&path.join("status"))
-            && tgid != pid
-        {
-            parent_pid = Some(tgid);
-            tasks = None;
-        }
-
+    // If the process' tgid doesn't match its pid, it is a task (thread).
+    // This check must apply in ALL modes, not just `Some`.
+    if let Some(tgid) = get_tgid(&path.join("status"))
+        && tgid != pid
+    {
+        parent_pid = Some(tgid);
+        tasks = None;
+        is_thread = true;
+        // Threads don't have meaningful tasks, clear whatever was fetched.
+        procs.clear();
+    } else if processes_to_update != ProcessesToUpdate::All {
         // Don't add the tasks to the list of processes to update
         procs.clear();
     }
 
     procs.push(ProcAndTasks {
+        is_thread,
         pid,
         parent_pid,
         path,
@@ -903,6 +975,7 @@ fn get_proc_tasks(path: &Path, parent_pid: Pid) -> Vec<ProcAndTasks> {
                 .filter(|(_, pid)| *pid != parent_pid)
                 .map(|(path, pid)| ProcAndTasks {
                     pid,
+                    is_thread: true,
                     path,
                     parent_pid: Some(parent_pid),
                     tasks: None,
@@ -1059,6 +1132,7 @@ impl std::ops::Deref for FileCounter {
         &self.0
     }
 }
+
 impl std::ops::DerefMut for FileCounter {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0

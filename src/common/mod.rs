@@ -116,20 +116,22 @@ macro_rules! gid {
     };
 }
 
-cfg_if! {
-    if #[cfg(all(
+cfg_select! {
+    all(
         not(feature = "unknown-ci"),
         any(
             target_os = "freebsd",
+            target_os = "netbsd",
             target_os = "linux",
             target_os = "android",
             target_os = "macos",
             target_os = "ios",
         )
-    ))] {
+    ) => {
         uid!(libc::uid_t, std::str::FromStr);
         gid!(libc::gid_t);
-    } else if #[cfg(windows)] {
+    }
+    windows => {
         uid!(crate::windows::Sid);
         gid!(u32);
         // Manual implementation outside of the macro...
@@ -141,7 +143,8 @@ cfg_if! {
                 Ok(Self(t.parse()?))
             }
         }
-    } else {
+    }
+    _ => {
         uid!(u32, std::str::FromStr);
         gid!(u32);
     }

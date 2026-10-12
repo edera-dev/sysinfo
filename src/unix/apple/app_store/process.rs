@@ -29,6 +29,10 @@ impl ProcessInner {
         Pid(0)
     }
 
+    pub(crate) fn cgroup_limits(&self) -> Option<crate::CGroupLimits> {
+        None
+    }
+
     pub(crate) fn environ(&self) -> &[OsString] {
         &[]
     }
@@ -109,5 +113,9 @@ impl ProcessInner {
 
     pub(crate) fn exists(&self) -> bool {
         false
+    }
+
+    pub(crate) fn open_files(&self) -> Option<usize> {
+        None
     }
 }

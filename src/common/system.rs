@@ -624,12 +624,9 @@ impl System {
         self.inner.used_swap()
     }
 
-    /// Retrieves the limits for the current cgroup (if any), otherwise it returns `None`.
+    /// Retrieves the limits for the root cgroup (if any), otherwise it returns `None`.
     ///
     /// This information is computed every time the method is called.
-    ///
-    /// ⚠️ You need to have run [`refresh_memory`](System::refresh_memory) at least once before
-    /// calling this method.
     ///
     /// ⚠️ This method is only implemented for Linux. It always returns `None` for all other
     /// systems.
@@ -920,6 +917,8 @@ impl System {
 
 /// This type allows to retrieve motherboard-related information.
 ///
+/// ⚠️ Not implemented on NetBSD.
+///
 /// ```
 /// use sysinfo::Motherboard;
 ///
@@ -1042,6 +1041,8 @@ impl Motherboard {
 }
 
 /// This type allows to retrieve product-related information.
+///
+/// ⚠️ Not implemented on NetBSD.
 ///
 /// ```
 /// use sysinfo::Product;
@@ -1314,16 +1315,16 @@ impl std::fmt::Display for Signal {
     }
 }
 
-/// Contains memory limits for the current process.
+/// Contains memory limits for a cgroup.
 #[derive(Default, Debug, Clone)]
 pub struct CGroupLimits {
-    /// Total memory (in bytes) for the current cgroup.
+    /// Total memory (in bytes) for the cgroup.
     pub total_memory: u64,
-    /// Free memory (in bytes) for the current cgroup.
+    /// Free memory (in bytes) for the cgroup.
     pub free_memory: u64,
-    /// Free swap (in bytes) for the current cgroup.
+    /// Free swap (in bytes) for the cgroup.
     pub free_swap: u64,
-    /// Resident Set Size (RSS) (in bytes) for the current cgroup.
+    /// Resident Set Size (RSS) (in bytes) for the cgroup.
     pub rss: u64,
 }
 
@@ -1380,6 +1381,10 @@ pub enum ProcessStatus {
     /// ## Linux
     ///
     /// Tracing stop (Linux 2.6.33 onward). Stopped by debugger during the tracing.
+    ///
+    /// ## NetBSD
+    ///
+    /// The process is being traced or debugged.
     ///
     /// ## Other OS
     ///
@@ -1441,6 +1446,14 @@ pub enum ProcessStatus {
     ///
     /// Not available.
     UninterruptibleDiskSleep,
+    /// ## NetBSD
+    ///
+    /// Suspended process.
+    ///
+    /// ## Other OS
+    ///
+    /// Not available.
+    Suspended,
     /// Unknown.
     Unknown(u32),
 }
@@ -1464,6 +1477,17 @@ pub enum KillError {
     /// The signal failed to be sent to the target process.
     FailedToSendSignal,
 }
+
+impl core::fmt::Display for KillError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::SignalDoesNotExist => f.write_str("signal does not exist"),
+            Self::FailedToSendSignal => f.write_str("failed to send signal"),
+        }
+    }
+}
+
+impl core::error::Error for KillError {}
 
 /// Struct containing information of a process.
 ///
@@ -1712,6 +1736,25 @@ impl Process {
         self.inner.pid()
     }
 
+    /// Retrieves the limits for the process cgroup (if any), otherwise it returns `None`.
+    ///
+    /// This information is computed every time the method is called.
+    ///
+    /// ⚠️ This method is only implemented for Linux. It always returns `None` for all other
+    /// systems.
+    ///
+    /// ```no_run
+    /// use sysinfo::{Pid, System};
+    ///
+    /// let s = System::new_all();
+    /// if let Some(process) = s.process(Pid::from(1337)) {
+    ///     println!("limits: {:?}", process.cgroup_limits());
+    /// }
+    /// ```
+    pub fn cgroup_limits(&self) -> Option<CGroupLimits> {
+        self.inner.cgroup_limits()
+    }
+
     /// Returns the environment variables of the process.
     ///
     /// ```no_run
@@ -1741,6 +1784,8 @@ impl Process {
     }
 
     /// Returns the path of the root directory.
+    ///
+    /// ⚠️ Not implemented in NetBSD.
     ///
     /// ```no_run
     /// use sysinfo::{Pid, System};
@@ -2067,13 +2112,14 @@ impl Process {
     /// }
     /// ```
     pub fn tasks(&self) -> Option<&HashSet<Pid>> {
-        cfg_if! {
-            if #[cfg(all(
+        cfg_select! {
+            all(
                 any(target_os = "linux", target_os = "android"),
                 not(feature = "unknown-ci")
-            ))] {
+            ) => {
                 self.inner.tasks.as_ref()
-            } else {
+            }
+            _ => {
                 None
             }
         }
@@ -2096,15 +2142,12 @@ impl Process {
     /// }
     /// ```
     pub fn thread_kind(&self) -> Option<ThreadKind> {
-        cfg_if! {
-            if #[cfg(all(
+        cfg_select! {
+            all(
                 any(target_os = "linux", target_os = "android"),
                 not(feature = "unknown-ci")
-            ))] {
-                self.inner.thread_kind()
-            } else {
-                None
-            }
+            ) => self.inner.thread_kind(),
+            _ => None,
         }
     }
 
@@ -2137,6 +2180,8 @@ impl Process {
     /// supported.
     ///
     /// **Important**: this information is computed every time this function is called.
+    ///
+    /// ⚠️ Not implemented on NetBSD.
     ///
     /// ```no_run
     /// use sysinfo::System;
@@ -2234,21 +2279,23 @@ macro_rules! pid_decl {
     };
 }
 
-cfg_if! {
-    if #[cfg(all(
+cfg_select! {
+    all(
         not(feature = "unknown-ci"),
         any(
             target_os = "freebsd",
+            target_os = "netbsd",
             target_os = "linux",
             target_os = "android",
             target_os = "macos",
             target_os = "ios",
         )
-    ))] {
+    ) => {
         use libc::pid_t;
 
         pid_decl!(pid_t);
-    } else {
+    }
+    _ => {
         pid_decl!(usize);
     }
 }
@@ -2701,28 +2748,32 @@ impl RefreshKind {
 /// ```
 #[allow(clippy::unnecessary_wraps)]
 pub fn get_current_pid() -> Result<Pid, &'static str> {
-    cfg_if! {
-        if #[cfg(feature = "unknown-ci")] {
+    cfg_select! {
+        feature = "unknown-ci" => {
             fn inner() -> Result<Pid, &'static str> {
                 Err("Unknown platform (CI)")
             }
-        } else if #[cfg(any(
+        }
+        any(
             target_os = "freebsd",
+            target_os = "netbsd",
             target_os = "linux",
             target_os = "android",
             target_os = "macos",
             target_os = "ios",
-        ))] {
+        ) => {
             fn inner() -> Result<Pid, &'static str> {
                 unsafe { Ok(Pid(libc::getpid())) }
             }
-        } else if #[cfg(windows)] {
+        }
+        windows => {
             fn inner() -> Result<Pid, &'static str> {
                 use windows::Win32::System::Threading::GetCurrentProcessId;
 
                 unsafe { Ok(Pid(GetCurrentProcessId() as _)) }
             }
-        } else {
+        }
+        _ => {
             fn inner() -> Result<Pid, &'static str> {
                 Err("Unknown platform")
             }
@@ -2843,7 +2894,7 @@ impl Cpu {
         self.inner.brand()
     }
 
-    /// Returns the CPU's frequency.
+    /// Returns the CPU's frequency (in MHz).
     ///
     /// ```no_run
     /// use sysinfo::{System, RefreshKind, CpuRefreshKind};
@@ -2905,11 +2956,15 @@ mod test {
             assert_eq!(proc_.frequency(), 0);
         }
         // In a VM, it'll fail.
-        if std::env::var("APPLE_CI").is_err() && std::env::var("FREEBSD_CI").is_err() {
-            s.refresh_cpu_specifics(CpuRefreshKind::everything());
-            for proc_ in s.cpus() {
-                assert_ne!(proc_.frequency(), 0);
-            }
+        if std::env::var("APPLE_CI").is_ok()
+            || std::env::var("FREEBSD_CI").is_ok()
+            || std::env::var("NETBSD_CI").is_ok()
+        {
+            return;
+        }
+        s.refresh_cpu_specifics(CpuRefreshKind::everything());
+        for proc_ in s.cpus() {
+            assert_ne!(proc_.frequency(), 0);
         }
     }
 

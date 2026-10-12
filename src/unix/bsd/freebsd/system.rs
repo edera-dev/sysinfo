@@ -12,56 +12,17 @@ use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use crate::sys::cpu::{CpusWrapper, physical_core_count};
 use crate::sys::process::get_exe;
 use crate::sys::utils::{
-    self, boot_time, c_buf_to_os_string, c_buf_to_utf8_string, from_cstr_array, get_sys_value,
-    get_sys_value_by_name, init_mib,
+    self, c_buf_to_os_string, c_buf_to_utf8_string, from_cstr_array, get_sys_value,
+    get_sys_value_by_name,
 };
+use crate::unix::bsd::common::{boot_time, init_mib};
 
 use libc::c_int;
-
-declare_signals! {
-    c_int,
-    Signal::Hangup => libc::SIGHUP,
-    Signal::Interrupt => libc::SIGINT,
-    Signal::Quit => libc::SIGQUIT,
-    Signal::Illegal => libc::SIGILL,
-    Signal::Trap => libc::SIGTRAP,
-    Signal::Abort => libc::SIGABRT,
-    Signal::IOT => libc::SIGIOT,
-    Signal::Bus => libc::SIGBUS,
-    Signal::FloatingPointException => libc::SIGFPE,
-    Signal::Kill => libc::SIGKILL,
-    Signal::User1 => libc::SIGUSR1,
-    Signal::Segv => libc::SIGSEGV,
-    Signal::User2 => libc::SIGUSR2,
-    Signal::Pipe => libc::SIGPIPE,
-    Signal::Alarm => libc::SIGALRM,
-    Signal::Term => libc::SIGTERM,
-    Signal::Child => libc::SIGCHLD,
-    Signal::Continue => libc::SIGCONT,
-    Signal::Stop => libc::SIGSTOP,
-    Signal::TSTP => libc::SIGTSTP,
-    Signal::TTIN => libc::SIGTTIN,
-    Signal::TTOU => libc::SIGTTOU,
-    Signal::Urgent => libc::SIGURG,
-    Signal::XCPU => libc::SIGXCPU,
-    Signal::XFSZ => libc::SIGXFSZ,
-    Signal::VirtualAlarm => libc::SIGVTALRM,
-    Signal::Profiling => libc::SIGPROF,
-    Signal::Winch => libc::SIGWINCH,
-    Signal::IO => libc::SIGIO,
-    Signal::Sys => libc::SIGSYS,
-    _ => None,
-}
-
-#[doc = include_str!("../../../md_doc/supported_signals.md")]
-pub const SUPPORTED_SIGNALS: &[crate::Signal] = supported_signals();
-#[doc = include_str!("../../../md_doc/minimum_cpu_update_interval.md")]
-pub const MINIMUM_CPU_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
 pub(crate) struct SystemInner {
     process_list: HashMap<Pid, Process>,
@@ -304,9 +265,11 @@ impl SystemInner {
             _ => (libc::KERN_PROC_PROC, 0),
         };
 
+        let Some(kd) = self.system_info.get_kd() else {
+            return 0;
+        };
         let mut count = 0;
-        let kvm_procs =
-            unsafe { libc::kvm_getprocs(self.system_info.kd.as_ptr(), op, arg, &mut count) };
+        let kvm_procs = unsafe { libc::kvm_getprocs(kd.as_ptr(), op, arg, &mut count) };
         if count < 1 {
             sysinfo_debug!("kvm_getprocs returned nothing...");
             return 0;
@@ -382,7 +345,7 @@ impl SystemInner {
 
             for kproc in kvm_procs {
                 if let Some(process) = self.process_list.get_mut(&Pid(kproc.ki_pid)) {
-                    add_missing_proc_info(&mut self.system_info, kproc, process, refresh_kind);
+                    add_missing_proc_info(&mut self.system_info, kproc, process, refresh_kind, kd);
                 }
             }
         }
@@ -395,9 +358,10 @@ unsafe fn add_missing_proc_info(
     kproc: &libc::kinfo_proc,
     proc_: &mut Process,
     refresh_kind: ProcessRefreshKind,
+    kd: NonNull<libc::kvm_t>,
 ) {
     {
-        let kd = system_info.kd.as_ptr();
+        let kd = kd.as_ptr();
         let proc_inner = &mut proc_.inner;
         let cmd_needs_update = refresh_kind
             .cmd()
@@ -486,7 +450,7 @@ struct SystemInfo {
     virtual_inactive_count: [c_int; 4],
     virtual_free_count: [c_int; 4],
     buf_space: [c_int; 2],
-    kd: NonNull<libc::kvm_t>,
+    kd: Option<NonNull<libc::kvm_t>>,
     /// From FreeBSD manual: "The kernel fixed-point scale factor". It's used when computing
     /// processes' CPU usage.
     fscale: f32,
@@ -501,17 +465,6 @@ unsafe impl Sync for SystemInfo {}
 impl SystemInfo {
     fn new() -> Self {
         unsafe {
-            let mut errbuf =
-                MaybeUninit::<[libc::c_char; libc::_POSIX2_LINE_MAX as usize]>::uninit();
-            let kd = NonNull::new(libc::kvm_openfiles(
-                std::ptr::null(),
-                c"/dev/null".as_ptr() as *const _,
-                std::ptr::null(),
-                0,
-                errbuf.as_mut_ptr() as *mut _,
-            ))
-            .expect("kvm_openfiles failed");
-
             let mut si = SystemInfo {
                 hw_physical_memory: Default::default(),
                 page_size: 0,
@@ -522,7 +475,7 @@ impl SystemInfo {
                 virtual_inactive_count: Default::default(),
                 virtual_free_count: Default::default(),
                 buf_space: Default::default(),
-                kd,
+                kd: None,
                 fscale: 0.,
                 procstat: std::ptr::null_mut(),
                 zfs: Zfs::new(),
@@ -535,7 +488,10 @@ impl SystemInfo {
             si.fscale = fscale as f32;
 
             if !get_sys_value_by_name(b"vm.stats.vm.v_page_size\0", &mut si.page_size) {
-                panic!("cannot get page size...");
+                sysinfo_debug!(
+                    "failed to get page size, memory information retrieval will be limited"
+                );
+                si.page_size = 0;
             }
 
             init_mib(b"hw.physmem\0", &mut si.hw_physical_memory);
@@ -557,16 +513,41 @@ impl SystemInfo {
         }
     }
 
+    fn get_kd(&mut self) -> Option<NonNull<libc::kvm_t>> {
+        if self.kd.is_none() {
+            let mut errbuf =
+                MaybeUninit::<[libc::c_char; libc::_POSIX2_LINE_MAX as usize]>::uninit();
+
+            unsafe {
+                self.kd = NonNull::new(libc::kvm_openfiles(
+                    std::ptr::null(),
+                    c"/dev/null".as_ptr() as *const _,
+                    std::ptr::null(),
+                    0,
+                    errbuf.as_mut_ptr() as *mut _,
+                ));
+            }
+            if self.kd.is_none() {
+                sysinfo_debug!(
+                    "`kvm_openfiles` failed, system information retrieval will be limited"
+                );
+            }
+        }
+        self.kd
+    }
+
     /// Returns (used, total).
-    fn get_swap_info(&self) -> (u64, u64) {
+    fn get_swap_info(&mut self) -> (u64, u64) {
         // Magic number used in htop. Cannot find how they got it when reading `kvm_getswapinfo`
         // source code so here we go...
         const LEN: usize = 16;
         let mut swap = MaybeUninit::<[libc::kvm_swap; LEN]>::uninit();
+        let Some(kd) = self.get_kd() else {
+            return (0, 0);
+        };
         unsafe {
-            let nswap =
-                libc::kvm_getswapinfo(self.kd.as_ptr(), swap.as_mut_ptr() as *mut _, LEN as _, 0)
-                    as usize;
+            let nswap = libc::kvm_getswapinfo(kd.as_ptr(), swap.as_mut_ptr() as *mut _, LEN as _, 0)
+                as usize;
             if nswap < 1 {
                 return (0, 0);
             }
@@ -703,7 +684,9 @@ impl SystemInfo {
 impl Drop for SystemInfo {
     fn drop(&mut self) {
         unsafe {
-            libc::kvm_close(self.kd.as_ptr());
+            if let Some(kd) = self.kd {
+                libc::kvm_close(kd.as_ptr());
+            }
             if !self.procstat.is_null() {
                 libc::procstat_close(self.procstat);
             }

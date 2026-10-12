@@ -25,7 +25,7 @@ pub(crate) struct DiskInner {
     mount_point: PathBuf,
     total_space: u64,
     available_space: u64,
-    file_system: OsString,
+    pub(crate) file_system: OsString,
     is_removable: bool,
     is_read_only: bool,
     read_bytes: u64,
@@ -33,6 +33,28 @@ pub(crate) struct DiskInner {
     written_bytes: u64,
     old_written_bytes: u64,
     updated: bool,
+}
+
+#[cfg(test)]
+impl Default for DiskInner {
+    fn default() -> Self {
+        Self {
+            name: OsString::new(),
+            c_mount_point: Vec::new(),
+            dev_id: None,
+            mount_point: PathBuf::new(),
+            total_space: 0,
+            available_space: 0,
+            file_system: OsString::new(),
+            is_removable: false,
+            is_read_only: false,
+            read_bytes: 0,
+            old_read_bytes: 0,
+            written_bytes: 0,
+            old_written_bytes: 0,
+            updated: false,
+        }
+    }
 }
 
 impl DiskInner {
@@ -354,7 +376,7 @@ pub unsafe fn get_all_list(
             | b"linsysfs" => {
                 sysinfo_debug!(
                     "Memory filesystem `{:?}`, ignoring it.",
-                    c_buf_to_utf8_str(&fs_info.f_fstypename).unwrap(),
+                    c_buf_to_utf8_str(&fs_info.f_fstypename),
                 );
                 continue;
             }
@@ -372,7 +394,9 @@ pub unsafe fn get_all_list(
         if mount_point == "/boot/efi" {
             continue;
         }
-        let name = if mount_point == "/" {
+        let name = if &fs_type[..] == b"zfs" {
+            OsString::from(c_buf_to_utf8_str(&fs_info.f_mntfromname).unwrap_or("")) // add zfs ds
+        } else if mount_point == "/" {
             OsString::from("root")
         } else {
             OsString::from(mount_point)

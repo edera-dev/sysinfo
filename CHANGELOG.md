@@ -1,3 +1,64 @@
+# 0.39.5
+
+ * macOS: Fix build for apple app store
+
+# 0.39.4
+
+ * Unix: Fix soundness issue when retrieving user's groups.
+ * macOS: Add new macOS version name.
+ * macOS: Fix inaccurate `open_files` returned value.
+
+# 0.39.3
+
+ * Unix: Fix retrieval of `Network::mac_addr`.
+ * Linux: Improve retrieval of process information if process terminates while doing so.
+
+# 0.39.2
+
+ * Windows: Greatly improve performance of `System::refresh_cpu_specifics` when CPU usage is not requested.
+ * iOS: Fix compilation error when `user` feature is enabled.
+ * Linux: Correctly set thread information for processes.
+
+# 0.39.1
+
+ * Linux: Fix wrong network numbers computation.
+
+# 0.39.0
+
+ * Update minimum supported rust version to `1.95`.
+ * Add new `NetworkData::operational_state` API.
+ * Add new `Process::cgroup_limits` API (only returning data on Linux).
+ * All supported systems other than Windows: Improve performance of `Networks::refresh*`.
+ * All supported systems other than Windows: Fix soundness issue when retrieving users.
+ * Linux: Take into account parent cgroup memory limits.
+ * Linux: Fix panic when retrieving process information on `ESXi`.
+ * FreeBSD: Use the name of dataset as `name` for zfs disks.
+
+# 0.38.4
+
+ * macOS: Unpin `objc2-*` crates version.
+ * Linux: Fix computation of disk size.
+
+# 0.38.3
+
+ * macOS: Improve accuracy of `System::available_memory` and `System::used_memory`.
+ * Documentation: add missing unit for `CPU::frequency` returned value.
+
+# 0.38.2
+
+ * Implement `Error` trait for `MacAddrFromStrError`, `IpNetworkFromStrError` and `KillError` types.
+
+# 0.38.1
+
+ * macOS: Put back support for versions below macOS 12.
+
+# 0.38.0
+
+ * Add NetBSD support.
+ * Windows: Fix unsoundness for a function used in `Motherboard` and `Product`.
+ * Linux: Improve CPU info parsing.
+ * Fix `serde` serialization of `MacAddr` and of `Disk::file_system`.
+
 # 0.37.2
 
  * Improve documentation of `System::refresh_cpu_all` and of `System::refresh_cpu_specifics`.

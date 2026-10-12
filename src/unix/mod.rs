@@ -1,13 +1,14 @@
 // Take a look at the license at the top of the repository in the LICENSE file.
 
-cfg_if! {
-    if #[cfg(any(target_os = "macos", target_os = "ios"))] {
+cfg_select! {
+    any(target_os = "macos", target_os = "ios") => {
         pub(crate) mod apple;
         pub(crate) use apple as sys;
 
         #[allow(unused_imports)]
         pub(crate) use libc::__error as libc_errno;
-    } else if #[cfg(any(target_os = "linux", target_os = "android"))] {
+    }
+    any(target_os = "linux", target_os = "android") => {
         pub(crate) mod linux;
         pub(crate) use linux as sys;
 
@@ -17,17 +18,21 @@ cfg_if! {
         #[cfg(target_os = "android")]
         #[allow(unused_imports)]
         pub(crate) use libc::__errno as libc_errno;
-    } else if #[cfg(target_os = "freebsd")] {
-        pub(crate) mod freebsd;
-        pub(crate) use freebsd as sys;
+    }
+    any(target_os = "freebsd", target_os = "netbsd") => {
+        pub(crate) mod bsd;
+        pub(crate) use bsd as sys;
 
         #[allow(unused_imports)]
-        pub(crate) use libc::__error as libc_errno;
-    } else {
+        pub(crate) use bsd::libc_errno;
+    }
+    _ => {
         compile_error!("Invalid cfg!");
     }
+}
 
-    if #[cfg(feature = "disk")] {
+cfg_select! {
+    feature = "disk" => {
         pub(crate) struct DisksInner {
             pub(crate) disks: Vec<crate::Disk>,
         }
@@ -42,15 +47,21 @@ cfg_if! {
             }
         }
     }
+    _ => {}
+}
 
-    if #[cfg(feature = "network")] {
-        pub(crate) mod network_helper;
-    }
+#[cfg(feature = "network")]
+pub(crate) mod network_helper;
 
-    if #[cfg(feature = "user")] {
+cfg_select! {
+    feature = "user" => {
+        // On iOS the apple module provides its own `UserInner`/`get_users`
+        // stubs, so `unix::users` is unused there.
+        #[cfg(not(target_os = "ios"))]
         pub(crate) mod users;
         pub(crate) mod groups;
     }
+    _ => {}
 }
 
 pub(crate) mod utils;
@@ -59,12 +70,10 @@ pub(crate) mod utils;
 #[cfg(any())]
 mod apple;
 #[cfg(any())]
-mod freebsd;
+mod bsd;
 #[cfg(any())]
 mod groups;
 #[cfg(any())]
 mod linux;
-#[cfg(any())]
-mod network_helper;
 #[cfg(any())]
 mod users;
